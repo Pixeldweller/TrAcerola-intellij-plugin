@@ -1,0 +1,52 @@
+<!-- Plugin Configuration File: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>com.pixeldweller.tracerola</id>
+    <name>TrAcerola</name>
+    <vendor url="https://github.com/Pixeldweller">pixeldweller</vendor>
+
+    <description><![CDATA[
+        Breakpoint-driven test case generator for IntelliJ IDEA.<br/>
+        <br/>
+        When paused at a breakpoint inside a Spring service or repository method, TrAcerola
+        analyses the method body, discovers all injected dependencies (@Autowired / @Inject /
+        @Resource), traces every external call made on those dependencies, and generates a
+        JUnit 5 + Mockito test skeleton — complete with @Mock fields, when/thenReturn setup,
+        method invocation, and assertion placeholders — ready for immediate review and editing.
+        <br/><br/>
+        <b>How to use:</b>
+        <ol>
+          <li>Start a debug session and pause at a breakpoint inside any method.</li>
+          <li>Click <i>Generate Test from Breakpoint</i> in the debugger toolbar (or via the Run menu).</li>
+          <li>TrAcerola generates the test skeleton and opens it for review.</li>
+          <li>Click <i>Insert into Test File</i> to append the method to the existing test class
+              (or create a new one), then run and refine.</li>
+        </ol>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+
+    <resource-bundle>messages.TracerolaBundle</resource-bundle>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <projectService serviceImplementation="com.pixeldweller.tracerola.service.TracerolaStateService"/>
+
+        <toolWindow id="TrAcerola"
+                    anchor="bottom"
+                    factoryClass="com.pixeldweller.tracerola.ui.TracerolaToolWindowFactory"
+                    icon="AllIcons.Toolwindows.ToolWindowDebugger"/>
+
+        <notificationGroup id="TrAcerola Notifications" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <action id="TrAcerola.TraceMethod"
+                class="com.pixeldweller.tracerola.action.TraceMethodAction"
+                text="Generate Test from Breakpoint"
+                description="Analyse the paused breakpoint method and generate a JUnit 5 + Mockito test skeleton"
+                icon="AllIcons.Actions.AddFile">
+            <add-to-group group-id="XDebugger.ToolWindow.TopToolbar" anchor="last"/>
+            <add-to-group group-id="RunMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
