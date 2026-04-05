@@ -36,15 +36,33 @@ public final class TestCaseGenerator {
         StringBuilder sb = new StringBuilder();
         String testName = "test" + capitalize(session.getMethodName()) + "_generated";
 
-        sb.append("    @Test\n");
-        sb.append("    void ").append(testName).append("() {\n");
+        sb.append("@Test\n");
+        sb.append("void ").append(testName).append("() {\n");
 
         // --- Parameters ---
         if (!session.getParameters().isEmpty()) {
-            sb.append("        // Parameters captured at breakpoint\n");
+            boolean anyTraced = session.getParameters().stream()
+                    .anyMatch(p -> p.getValue() != null || p.isComposite());
+            sb.append("    // Parameters ").append(anyTraced ? "traced" : "captured")
+              .append(" at breakpoint\n");
             for (CapturedParameter p : session.getParameters()) {
-                sb.append("        ").append(p.getType()).append(' ').append(p.getName())
-                  .append(" = ").append(p.getValueOrPlaceholder()).append(";\n");
+                if (p.isComposite()) {
+                    sb.append("    ").append(p.getType()).append(' ').append(p.getName())
+                      .append(" = new ").append(p.getType()).append("(); // traced\n");
+                    for (CapturedParameter.CapturedField f : p.getFields()) {
+                        if (f.value() != null) {
+                            sb.append("    ").append(p.getName()).append('.')
+                              .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                        }
+                    }
+                } else {
+                    sb.append("    ").append(p.getType()).append(' ').append(p.getName())
+                      .append(" = ").append(p.getValueOrPlaceholder()).append(';');
+                    if (p.getValue() != null) {
+                        sb.append(" // traced");
+                    }
+                    sb.append('\n');
+                }
             }
             sb.append('\n');
         }
@@ -54,24 +72,31 @@ public final class TestCaseGenerator {
                 .filter(c -> !"void".equals(c.getReturnType()))
                 .toList();
         if (!mockable.isEmpty()) {
-            sb.append("        // Mock setup\n");
+            sb.append("    // Mock setup\n");
             for (TracedCall c : mockable) {
-                String placeholder = c.getMockReturnPlaceholder();
-                sb.append("        when(").append(c.getQualifierName()).append('.')
+                String returnValue = c.getMockReturnPlaceholder();
+                if(c.getCapturedReturnValue() != null){
+                    returnValue = c.getCapturedReturnValue();
+                }
+                sb.append("    when(").append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
                   .append(String.join(", ", c.getArgExpressions()))
-                  .append(")).thenReturn(").append(placeholder).append(");\n");
+                  .append(")).thenReturn(").append(returnValue).append(");");
+                if (c.getCapturedReturnValue() != null) {
+                    sb.append(" // traced " + c.getCapturedReturnValue().toString());
+                }
+                sb.append('\n');
             }
             sb.append('\n');
         }
 
         // --- Execute ---
-        sb.append("        // Execute\n");
+        sb.append("    // Execute\n");
         boolean returnsValue = !"void".equals(session.getReturnType());
         if (returnsValue) {
-            sb.append("        ").append(session.getReturnType()).append(" result = ");
+            sb.append("    ").append(session.getReturnType()).append(" result = ");
         } else {
-            sb.append("        ");
+            sb.append("    ");
         }
         sb.append(decapitalize(session.getClassName())).append('.').append(session.getMethodName()).append('(');
         List<String> paramNames = session.getParameters().stream()
@@ -80,20 +105,20 @@ public final class TestCaseGenerator {
         sb.append(");\n\n");
 
         // --- Assertions ---
-        sb.append("        // Assert — TODO: replace placeholders with expected values\n");
+        sb.append("    // Assert - TODO: replace placeholders with expected values\n");
         if (returnsValue) {
-            sb.append("        assertNotNull(result);\n");
+            sb.append("    assertNotNull(result);\n");
         }
         for (TracedCall c : session.getTracedCalls()) {
             if ("void".equals(c.getReturnType())) {
-                sb.append("        verify(").append(c.getQualifierName()).append(").")
+                sb.append("    verify(").append(c.getQualifierName()).append(").")
                   .append(c.getMethodName()).append('(')
                   .append(String.join(", ", c.getArgExpressions()))
                   .append(");\n");
             }
         }
 
-        sb.append("    }");
+        sb.append("}");
         return sb.toString();
     }
 
@@ -152,8 +177,14 @@ public final class TestCaseGenerator {
         sb.append("    @InjectMocks\n");
         sb.append("    private ").append(subjectClass).append(' ').append(subjectField).append(";\n\n");
 
-        // The generated test method
-        sb.append(generateTestMethod(session)).append('\n');
+        // The generated test method — re-indent for class body
+        String method = generateTestMethod(session);
+        for (String line : method.split("\n", -1)) {
+            if (!line.isEmpty()) {
+                sb.append("    ").append(line);
+            }
+            sb.append('\n');
+        }
 
         sb.append("}\n");
         return sb.toString();

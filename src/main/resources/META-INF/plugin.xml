@@ -16,8 +16,10 @@
         <b>How to use:</b>
         <ol>
           <li>Start a debug session and pause at a breakpoint inside any method.</li>
-          <li>Click <i>Generate Test from Breakpoint</i> in the debugger toolbar (or via the Run menu).</li>
-          <li>TrAcerola generates the test skeleton and opens it for review.</li>
+          <li>Right-click and choose <i>Trace this Method</i>, or use the debugger toolbar, Run menu,
+              or press <b>Ctrl+Alt+Shift+T</b>.</li>
+          <li>TrAcerola reads the actual runtime parameter values from the debugger,
+              traces external dependency calls, and generates a test skeleton with real values.</li>
           <li>Click <i>Insert into Test File</i> to append the method to the existing test class
               (or create a new one), then run and refine.</li>
         </ol>
@@ -39,14 +41,25 @@
         <notificationGroup id="TrAcerola Notifications" displayType="BALLOON"/>
     </extensions>
 
+    <projectListeners>
+        <listener class="com.pixeldweller.tracerola.debug.DebugSessionListener"
+                  topic="com.intellij.xdebugger.XDebuggerManagerListener"/>
+    </projectListeners>
+
     <actions>
         <action id="TrAcerola.TraceMethod"
                 class="com.pixeldweller.tracerola.action.TraceMethodAction"
-                text="Generate Test from Breakpoint"
-                description="Analyse the paused breakpoint method and generate a JUnit 5 + Mockito test skeleton"
+                text="Trace this Method"
+                description="Trace the paused method and generate a JUnit 5 + Mockito test with captured runtime values"
                 icon="AllIcons.Actions.AddFile">
+            <!-- Debugger toolbar -->
             <add-to-group group-id="XDebugger.ToolWindow.TopToolbar" anchor="last"/>
+            <!-- Run menu -->
             <add-to-group group-id="RunMenu" anchor="last"/>
+            <!-- Right-click in editor -->
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <!-- Keyboard shortcut: Ctrl+Shift+T is taken, use Ctrl+Alt+Shift+T -->
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift T"/>
         </action>
     </actions>
 </idea-plugin>

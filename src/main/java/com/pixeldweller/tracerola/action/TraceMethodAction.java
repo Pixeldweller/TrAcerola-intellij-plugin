@@ -5,11 +5,13 @@ import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
 import com.intellij.psi.*;
 import com.intellij.psi.util.PsiTreeUtil;
 import com.intellij.xdebugger.XDebugSession;
 import com.intellij.xdebugger.XDebuggerManager;
 import com.intellij.xdebugger.XSourcePosition;
+import com.pixeldweller.tracerola.debug.MethodStepper;
 import com.pixeldweller.tracerola.debug.MethodTracer;
 import com.pixeldweller.tracerola.debug.ParameterEvaluator;
 import com.pixeldweller.tracerola.generator.TestCaseGenerator;
@@ -23,18 +25,18 @@ import org.jetbrains.annotations.NotNull;
 import java.util.List;
 
 /**
- * The single entry-point action for TrAcerola.
+ * "Trace this Method" — the main entry-point action for TrAcerola.
  *
- * <p>When the debugger is paused at a breakpoint this action:
+ * <p>When the debugger is paused at a breakpoint (ideally at the start of
+ * a method), this action:
  * <ol>
- *   <li>Resolves the breakpoint's source position to a {@link PsiMethod}.</li>
- *   <li>Extracts parameter names/types (and runtime values where available).</li>
- *   <li>Traces every call made on injected dependencies in the method body.</li>
- *   <li>Generates a JUnit 5 + Mockito test skeleton.</li>
- *   <li>Opens {@link GeneratedTestDialog} for review / insertion.</li>
+ *   <li>Captures parameter values (drilling into object fields via PSI).</li>
+ *   <li>Analyses the method body to find all dependency calls (PSI).</li>
+ *   <li>Automatically steps over (F8) each line until the method returns.</li>
+ *   <li>After each step, captures return values from dependency calls.</li>
+ *   <li>Generates a JUnit 5 + Mockito test skeleton with all traced values.</li>
+ *   <li>Opens the review dialog.</li>
  * </ol>
- *
- * <p>The action is disabled automatically when no debug session is paused.
  */
 public class TraceMethodAction extends AnAction {
 
@@ -54,64 +56,105 @@ public class TraceMethodAction extends AnAction {
         Project project = e.getProject();
         if (project == null) return;
 
+        TracerolaStateService stateService = project.getService(TracerolaStateService.class);
+
         XDebugSession debugSession = XDebuggerManager.getInstance(project).getCurrentSession();
         if (debugSession == null || !debugSession.isPaused()) {
-            project.getService(TracerolaStateService.class)
-                    .notify("No active paused debug session found. Pause at a breakpoint first.",
-                            NotificationType.WARNING);
+            stateService.notify("No active paused debug session. Pause at a breakpoint first.",
+                    NotificationType.WARNING);
             return;
         }
 
         XSourcePosition position = debugSession.getCurrentPosition();
         if (position == null) {
-            project.getService(TracerolaStateService.class)
-                    .notify("Cannot determine current source position.", NotificationType.WARNING);
+            stateService.notify("Cannot determine current source position.",
+                    NotificationType.WARNING);
             return;
         }
 
-        // PSI reads must happen inside a read action
-        ApplicationManager.getApplication().runReadAction(() -> {
-            PsiFile psiFile = PsiManager.getInstance(project).findFile(position.getFile());
-            if (!(psiFile instanceof PsiJavaFile javaFile)) {
-                project.getService(TracerolaStateService.class)
-                        .notify("TrAcerola only works with Java source files.", NotificationType.WARNING);
-                return;
-            }
+        // --- Resolve PSI (read action on EDT) ---
+        Object[] psi = ApplicationManager.getApplication().runReadAction(
+                (Computable<Object[]>) () -> {
+                    PsiFile psiFile = PsiManager.getInstance(project).findFile(position.getFile());
+                    if (!(psiFile instanceof PsiJavaFile javaFile)) return null;
 
-            PsiElement element = psiFile.findElementAt(position.getOffset());
-            PsiMethod method = PsiTreeUtil.getParentOfType(element, PsiMethod.class);
-            if (method == null) {
-                project.getService(TracerolaStateService.class)
-                        .notify("No method found at the current breakpoint position.", NotificationType.WARNING);
-                return;
-            }
+                    PsiElement element = psiFile.findElementAt(position.getOffset());
+                    PsiMethod method = PsiTreeUtil.getParentOfType(element, PsiMethod.class);
+                    if (method == null) return null;
 
-            PsiClass containingClass = method.getContainingClass();
-            String className = containingClass != null ? containingClass.getName() : "Unknown";
-            String packageName = javaFile.getPackageName();
-            String returnType = method.getReturnType() != null
-                    ? method.getReturnType().getPresentableText() : "void";
+                    return new Object[]{javaFile, method};
+                });
 
-            // --- Capture parameters ---
-            List<CapturedParameter> params = ParameterEvaluator.evaluate(method, debugSession);
+        if (psi == null) {
+            stateService.notify("No Java method found at the current breakpoint position.",
+                    NotificationType.WARNING);
+            return;
+        }
 
-            // --- Trace external calls ---
-            List<TracedCall> calls = MethodTracer.trace(method);
+        PsiJavaFile javaFile = (PsiJavaFile) psi[0];
+        PsiMethod method = (PsiMethod) psi[1];
 
-            // --- Build session ---
-            TraceSession traceSession = new TraceSession(
-                    packageName, className, method.getName(), returnType, params, calls);
+        // --- Read PSI metadata + capture parameters ---
+        String[] meta = ApplicationManager.getApplication().runReadAction(
+                (Computable<String[]>) () -> {
+                    PsiClass cls = method.getContainingClass();
+                    String className = cls != null ? cls.getName() : "Unknown";
+                    String packageName = javaFile.getPackageName();
+                    String methodName = method.getName();
+                    String returnType = method.getReturnType() != null
+                            ? method.getReturnType().getPresentableText() : "void";
+                    return new String[]{className, packageName, methodName, returnType};
+                });
 
-            // --- Generate source ---
-            String code = TestCaseGenerator.generateFullClass(traceSession);
+        String className = meta[0];
+        String packageName = meta[1];
+        String methodName = meta[2];
+        String returnType = meta[3];
 
-            // --- Persist ---
-            TracerolaStateService service = project.getService(TracerolaStateService.class);
-            service.addSession(traceSession, code);
+        stateService.notify("Tracing " + className + "." + methodName + "()…",
+                NotificationType.INFORMATION);
 
-            // --- Open dialog on the EDT ---
-            ApplicationManager.getApplication().invokeLater(
-                    () -> new GeneratedTestDialog(project, traceSession, code).show());
-        });
+        // Capture parameters (evaluates via debugger — needs read action for PSI)
+        List<CapturedParameter> params = ApplicationManager.getApplication().runReadAction(
+                (Computable<List<CapturedParameter>>) () ->
+                        ParameterEvaluator.evaluate(method, debugSession));
+
+        // Trace calls + get method line range (read action)
+        List<TracedCall> calls = ApplicationManager.getApplication().runReadAction(
+                (Computable<List<TracedCall>>) () -> MethodTracer.trace(method));
+
+        int[] lineRange = ApplicationManager.getApplication().runReadAction(
+                (Computable<int[]>) () -> MethodTracer.getMethodLineRange(method));
+
+        if (lineRange == null) {
+            // Can't determine line range — fall back to no-stepping mode
+            buildAndShow(project, stateService, packageName, className, methodName,
+                    returnType, params, calls);
+            return;
+        }
+
+        // --- Start auto-stepping ---
+        MethodStepper stepper = new MethodStepper(
+                debugSession, calls, lineRange[0], lineRange[1],
+                () -> {
+                    // Stepping complete — generate test on EDT
+                    ApplicationManager.getApplication().invokeLater(() ->
+                            buildAndShow(project, stateService, packageName, className,
+                                    methodName, returnType, params, calls));
+                });
+        stepper.start();
+    }
+
+    private void buildAndShow(@NotNull Project project,
+                              @NotNull TracerolaStateService stateService,
+                              String packageName, String className, String methodName,
+                              String returnType, List<CapturedParameter> params,
+                              List<TracedCall> calls) {
+        TraceSession traceSession = new TraceSession(
+                packageName, className, methodName, returnType, params, calls);
+        String code = TestCaseGenerator.generateFullClass(traceSession);
+
+        stateService.addSession(traceSession, code);
+        new GeneratedTestDialog(project, traceSession, code).show();
     }
 }

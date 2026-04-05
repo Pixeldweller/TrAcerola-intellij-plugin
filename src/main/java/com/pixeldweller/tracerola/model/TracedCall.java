@@ -15,6 +15,12 @@ public final class TracedCall {
     private final String returnType;    // e.g. "boolean"
     private final List<String> argExpressions; // source text of each argument
 
+    /** 0-based line number of this call in the source file, or -1 if unknown. */
+    private int lineNumber = -1;
+
+    /** Variable name the return value is assigned to (e.g. "result"), or null. */
+    private String resultVariable;
+
     /** Set after evaluation if the debugger captured the actual return value. */
     private String capturedReturnValue;
 
@@ -35,11 +41,15 @@ public final class TracedCall {
     public String getMethodName()           { return methodName; }
     public String getReturnType()           { return returnType; }
     public List<String> getArgExpressions() { return argExpressions; }
-    public String getCapturedReturnValue()  { return capturedReturnValue; }
 
-    public void setCapturedReturnValue(String v) {
-        this.capturedReturnValue = v;
-    }
+    public int getLineNumber()              { return lineNumber; }
+    public void setLineNumber(int ln)       { this.lineNumber = ln; }
+
+    public String getResultVariable()       { return resultVariable; }
+    public void setResultVariable(String v) { this.resultVariable = v; }
+
+    public String getCapturedReturnValue()  { return capturedReturnValue; }
+    public void setCapturedReturnValue(String v) { this.capturedReturnValue = v; }
 
     /**
      * Returns the captured runtime return value when available, otherwise
@@ -58,6 +68,12 @@ public final class TracedCall {
             case "String"            -> "\"TODO\"";
             default                  -> "null /* TODO */";
         };
+    }
+
+    public String toExpression() {
+        return qualifierName + "." +
+                methodName +
+                "(" + String.join(", ", argExpressions) + ")";
     }
 
     /** Unique key used for deduplication within a single method body. */

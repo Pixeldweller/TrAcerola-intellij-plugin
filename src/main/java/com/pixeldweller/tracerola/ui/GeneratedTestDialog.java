@@ -68,10 +68,14 @@ public class GeneratedTestDialog extends DialogWrapper {
         root.setPreferredSize(new Dimension(820, 540));
 
         // Info bar
+        long tracedParams = session.getParameters().stream().filter(p -> p.getValue() != null).count();
+        long tracedMocks = session.getTracedCalls().stream()
+                .filter(c -> c.getCapturedReturnValue() != null).count();
         JLabel info = new JLabel(
                 "  Class: " + session.getClassName()
                 + "   Method: " + session.getMethodName()
-                + "   Mocks detected: " + session.getTracedCalls().size());
+                + "   Mocks: " + session.getTracedCalls().size()
+                + "   Traced values: " + (tracedParams + tracedMocks));
         info.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
         root.add(info, BorderLayout.NORTH);
 
