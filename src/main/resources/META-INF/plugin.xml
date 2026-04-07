@@ -36,7 +36,7 @@
         <toolWindow id="TrAcerola"
                     anchor="bottom"
                     factoryClass="com.pixeldweller.tracerola.ui.TracerolaToolWindowFactory"
-                    icon="AllIcons.Toolwindows.ToolWindowDebugger"/>
+                    icon="/icons/toolWindowAcerola.svg"/>
 
         <notificationGroup id="TrAcerola Notifications" displayType="BALLOON"/>
     </extensions>
@@ -51,7 +51,7 @@
                 class="com.pixeldweller.tracerola.action.TraceMethodAction"
                 text="Trace this Method"
                 description="Trace the paused method and generate a JUnit 5 + Mockito test with captured runtime values"
-                icon="AllIcons.Actions.AddFile">
+                icon="/icons/toolWindowAcerola.svg">
             <!-- Debugger toolbar -->
             <add-to-group group-id="XDebugger.ToolWindow.TopToolbar" anchor="last"/>
             <!-- Run menu -->
