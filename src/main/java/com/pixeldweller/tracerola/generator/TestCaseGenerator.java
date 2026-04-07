@@ -124,9 +124,23 @@ public final class TestCaseGenerator {
         sb.append(");\n\n");
 
         // --- Assertions ---
-        sb.append("    // Assert - TODO: replace placeholders with expected values\n");
+        sb.append("    // Assert\n");
         if (returnsValue) {
             sb.append("    assertNotNull(result);\n");
+
+            // Captured-value assertions: prefer field-by-field for composites
+            // (more informative failures), otherwise a single equality on result.
+            if (session.hasCapturedReturnFields()) {
+                for (CapturedParameter.CapturedField f : session.getCapturedReturnFields()) {
+                    if (f.value() != null) {
+                        sb.append("    assertEquals(").append(f.value())
+                          .append(", result.").append(f.getterName()).append("());\n");
+                    }
+                }
+            } else if (session.getCapturedReturnValue() != null) {
+                sb.append("    assertEquals(").append(session.getCapturedReturnValue())
+                  .append(", result);\n");
+            }
         }
         for (TracedCall c : session.getTracedCalls()) {
             if ("void".equals(c.getReturnType())) {

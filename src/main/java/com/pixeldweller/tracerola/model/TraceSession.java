@@ -1,7 +1,11 @@
 package com.pixeldweller.tracerola.model;
 
+import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
+import org.jetbrains.annotations.Nullable;
+
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -22,12 +26,30 @@ public final class TraceSession {
     private final List<TracedCall> tracedCalls;
     private final String timestamp;
 
+    /** Literal captured at the executed return statement, or {@code null}. */
+    private final String capturedReturnValue;
+
+    /** Per-field decomposition for composite returns. Empty when not applicable. */
+    private final List<CapturedField> capturedReturnFields;
+
     public TraceSession(String packageName,
                         String className,
                         String methodName,
                         String returnType,
                         List<CapturedParameter> parameters,
                         List<TracedCall> tracedCalls) {
+        this(packageName, className, methodName, returnType, parameters, tracedCalls,
+                null, Collections.emptyList());
+    }
+
+    public TraceSession(String packageName,
+                        String className,
+                        String methodName,
+                        String returnType,
+                        List<CapturedParameter> parameters,
+                        List<TracedCall> tracedCalls,
+                        @Nullable String capturedReturnValue,
+                        List<CapturedField> capturedReturnFields) {
         this.packageName = packageName;
         this.className = className;
         this.methodName = methodName;
@@ -35,6 +57,10 @@ public final class TraceSession {
         this.parameters = List.copyOf(parameters);
         this.tracedCalls = List.copyOf(tracedCalls);
         this.timestamp = LocalDateTime.now().format(TIME_FMT);
+        this.capturedReturnValue = capturedReturnValue;
+        this.capturedReturnFields = capturedReturnFields != null
+                ? List.copyOf(capturedReturnFields)
+                : Collections.emptyList();
     }
 
     public String getPackageName()               { return packageName; }
@@ -44,6 +70,20 @@ public final class TraceSession {
     public List<CapturedParameter> getParameters() { return parameters; }
     public List<TracedCall> getTracedCalls()     { return tracedCalls; }
     public String getTimestamp()                 { return timestamp; }
+
+    @Nullable
+    public String getCapturedReturnValue()       { return capturedReturnValue; }
+
+    public List<CapturedField> getCapturedReturnFields() { return capturedReturnFields; }
+
+    /** True when at least one return-field value was captured at the executed {@code return}. */
+    public boolean hasCapturedReturnFields() {
+        if (capturedReturnFields.isEmpty()) return false;
+        for (CapturedField f : capturedReturnFields) {
+            if (f.value() != null) return true;
+        }
+        return false;
+    }
 
     /** Fully-qualified name of the class under test. */
     public String getFullyQualifiedClassName() {

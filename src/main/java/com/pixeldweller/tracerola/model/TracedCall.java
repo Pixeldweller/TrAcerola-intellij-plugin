@@ -51,6 +51,15 @@ public final class TracedCall {
      */
     private List<CapturedField> capturedReturnFields = Collections.emptyList();
 
+    /**
+     * Candidate expressions to evaluate when {@link #resultVariable} is null.
+     * Populated by {@link com.pixeldweller.tracerola.debug.MethodTracer} for
+     * patterns like {@code target.setX(thisCall())} — in which case the result
+     * can be recovered after the step by reading {@code target.getX()} (or
+     * {@code target.isX()} for booleans). Tried in order; first non-null wins.
+     */
+    private List<String> backtraceExpressions = Collections.emptyList();
+
     public TracedCall(String qualifierName,
                       String qualifierType,
                       String methodName,
@@ -94,6 +103,11 @@ public final class TracedCall {
     /** True when the call has a decomposed composite return value ready for emission. */
     public boolean hasCapturedReturnFields() {
         return !capturedReturnFields.isEmpty();
+    }
+
+    public List<String> getBacktraceExpressions() { return backtraceExpressions; }
+    public void setBacktraceExpressions(List<String> exprs) {
+        this.backtraceExpressions = exprs != null ? List.copyOf(exprs) : Collections.emptyList();
     }
 
     /**

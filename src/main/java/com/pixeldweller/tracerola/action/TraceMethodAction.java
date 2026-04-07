@@ -16,6 +16,8 @@ import com.pixeldweller.tracerola.debug.MethodTracer;
 import com.pixeldweller.tracerola.debug.ParameterEvaluator;
 import com.pixeldweller.tracerola.generator.TestCaseGenerator;
 import com.pixeldweller.tracerola.model.CapturedParameter;
+import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
+import com.pixeldweller.tracerola.model.ReturnAnalysis;
 import com.pixeldweller.tracerola.model.TracedCall;
 import com.pixeldweller.tracerola.model.TraceSession;
 import com.pixeldweller.tracerola.service.TracerolaStateService;
@@ -126,32 +128,43 @@ public class TraceMethodAction extends AnAction {
         int[] lineRange = ApplicationManager.getApplication().runReadAction(
                 (Computable<int[]>) () -> MethodTracer.getMethodLineRange(method));
 
+        // Static analysis of the method's own return type — needed by the stepper
+        // to capture the value the method actually returns at its return statement.
+        ReturnAnalysis returnAnalysis = ApplicationManager.getApplication().runReadAction(
+                (Computable<ReturnAnalysis>) () -> MethodTracer.analyzeMethodReturn(method));
+
         if (lineRange == null) {
             // Can't determine line range — fall back to no-stepping mode
             buildAndShow(project, stateService, packageName, className, methodName,
-                    returnType, params, calls);
+                    returnType, params, calls, null, List.of());
             return;
         }
 
         // --- Start auto-stepping ---
-        MethodStepper stepper = new MethodStepper(
-                debugSession, calls, lineRange[0], lineRange[1],
-                () -> {
-                    // Stepping complete — generate test on EDT
-                    ApplicationManager.getApplication().invokeLater(() ->
-                            buildAndShow(project, stateService, packageName, className,
-                                    methodName, returnType, params, calls));
-                });
-        stepper.start();
+        // Holder lets the onComplete lambda reach back into the stepper for the
+        // values it captured during stepping (chicken-and-egg with effectively-final).
+        MethodStepper[] stepperHolder = new MethodStepper[1];
+        Runnable onComplete = () -> ApplicationManager.getApplication().invokeLater(() ->
+                buildAndShow(project, stateService, packageName, className, methodName,
+                        returnType, params, calls,
+                        stepperHolder[0].getCapturedMethodReturnValue(),
+                        stepperHolder[0].getCapturedMethodReturnFields()));
+
+        stepperHolder[0] = new MethodStepper(
+                debugSession, calls, lineRange[0], lineRange[1], returnAnalysis, onComplete);
+        stepperHolder[0].start();
     }
 
     private void buildAndShow(@NotNull Project project,
                               @NotNull TracerolaStateService stateService,
                               String packageName, String className, String methodName,
                               String returnType, List<CapturedParameter> params,
-                              List<TracedCall> calls) {
+                              List<TracedCall> calls,
+                              String capturedReturnValue,
+                              List<CapturedField> capturedReturnFields) {
         TraceSession traceSession = new TraceSession(
-                packageName, className, methodName, returnType, params, calls);
+                packageName, className, methodName, returnType, params, calls,
+                capturedReturnValue, capturedReturnFields);
         String code = TestCaseGenerator.generateFullClass(traceSession);
 
         stateService.addSession(traceSession, code);

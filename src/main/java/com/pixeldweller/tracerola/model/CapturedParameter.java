@@ -76,5 +76,17 @@ public final class CapturedParameter {
         public String setterName() {
             return "set" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         }
+
+        /**
+         * The getter method name for this field. Booleans use the {@code is}
+         * prefix; everything else uses {@code get}. Used by the test generator
+         * when emitting {@code assertEquals(value, result.getX())} lines.
+         */
+        public String getterName() {
+            String suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+            boolean isBool = "boolean".equals(fieldType) || "Boolean".equals(fieldType)
+                    || "java.lang.Boolean".equals(fieldType);
+            return (isBool ? "is" : "get") + suffix;
+        }
     }
 }

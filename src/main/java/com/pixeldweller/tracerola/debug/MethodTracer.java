@@ -2,6 +2,7 @@ package com.pixeldweller.tracerola.debug;
 
 import com.intellij.openapi.editor.Document;
 import com.intellij.psi.*;
+import com.pixeldweller.tracerola.model.ReturnAnalysis;
 import com.pixeldweller.tracerola.model.TracedCall;
 import com.pixeldweller.tracerola.model.TracedCall.ReturnFieldSignature;
 import org.jetbrains.annotations.NotNull;
@@ -104,7 +105,15 @@ public final class MethodTracer {
                 }
 
                 // Result variable — check if the call's return is assigned to a local var
-                tc.setResultVariable(findResultVariable(expr));
+                String resultVar = findResultVariable(expr);
+                tc.setResultVariable(resultVar);
+
+                // Backtrace — only if we couldn't find a direct result variable.
+                // Recovers values from patterns like target.setX(thisCall()) by
+                // recording target.getX() / target.isX() for the stepper to read.
+                if (resultVar == null) {
+                    tc.setBacktraceExpressions(findBacktraceExpressions(expr));
+                }
 
                 if (seen.add(tc.callKey())) {
                     calls.add(tc);
@@ -174,6 +183,117 @@ public final class MethodTracer {
         }
 
         return null;
+    }
+
+    /**
+     * Detects the {@code target.setX(thisCall())} pattern and returns one or more
+     * candidate expressions that the stepper can evaluate after the line executes
+     * to recover what {@code thisCall()} returned.
+     *
+     * <p>Two candidates are emitted (getter and is-prefix) so the stepper can try
+     * both without needing to know whether the underlying field is boolean.
+     * Returns an empty list when the parent isn't a single-arg setter call.
+     */
+    @NotNull
+    private static List<String> findBacktraceExpressions(@NotNull PsiMethodCallExpression call) {
+        PsiElement parent = call.getParent();
+        if (!(parent instanceof PsiExpressionList exprList)) return Collections.emptyList();
+
+        // Must be the *only* argument — otherwise we can't unambiguously map
+        // a getter back to this specific slot.
+        PsiExpression[] args = exprList.getExpressions();
+        if (args.length != 1 || args[0] != call) return Collections.emptyList();
+
+        PsiElement grandparent = parent.getParent();
+        if (!(grandparent instanceof PsiMethodCallExpression setterCall)) return Collections.emptyList();
+
+        PsiReferenceExpression setterRef = setterCall.getMethodExpression();
+        String setterName = setterRef.getReferenceName();
+        if (setterName == null || setterName.length() <= 3 || !setterName.startsWith("set")) {
+            return Collections.emptyList();
+        }
+
+        PsiExpression targetExpr = setterRef.getQualifierExpression();
+        if (targetExpr == null) return Collections.emptyList();
+
+        String targetText = targetExpr.getText();
+        String suffix = setterName.substring(3); // "setId" → "Id"
+        return List.of(
+                targetText + ".get" + suffix + "()",
+                targetText + ".is" + suffix + "()"
+        );
+    }
+
+    /**
+     * Static analysis of the method's own return type and (safe-to-evaluate)
+     * return statements. The result is consumed by {@link MethodStepper} to
+     * capture the value the method actually produces, which the test generator
+     * then turns into {@code assertEquals} lines.
+     *
+     * <p>Only return expressions that are bare {@link PsiReferenceExpression}s
+     * are recorded — anything containing a method call or arithmetic is skipped
+     * to avoid double-executing side effects when the stepper re-evaluates them.
+     */
+    @NotNull
+    public static ReturnAnalysis analyzeMethodReturn(@NotNull PsiMethod method) {
+        PsiType psiReturnType = method.getReturnType();
+        if (psiReturnType == null) return ReturnAnalysis.VOID;
+
+        String returnTypeText = psiReturnType.getPresentableText();
+        if ("void".equals(returnTypeText)) return ReturnAnalysis.VOID;
+
+        boolean isEnum = false;
+        List<ReturnFieldSignature> sigs = Collections.emptyList();
+
+        if (!SIMPLE_RETURN_TYPES.contains(returnTypeText) && psiReturnType instanceof PsiClassType classType) {
+            PsiClass psiClass = classType.resolve();
+            if (psiClass != null) {
+                if (psiClass.isEnum()) {
+                    isEnum = true;
+                } else {
+                    List<ReturnFieldSignature> tmp = new ArrayList<>();
+                    for (PsiField f : psiClass.getAllFields()) {
+                        if (f.hasModifierProperty(PsiModifier.STATIC)) continue;
+                        if (f.getName().startsWith("this$")) continue;
+                        tmp.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText()));
+                    }
+                    sigs = tmp;
+                }
+            }
+        }
+
+        Map<Integer, String> returnPoints = findReturnPoints(method);
+        return new ReturnAnalysis(returnTypeText, isEnum, sigs, returnPoints);
+    }
+
+    /**
+     * Walks the method body for {@code return} statements whose expression is a
+     * bare {@link PsiReferenceExpression}. Returns a map keyed by 0-based line
+     * number so the stepper can match against the current paused line.
+     */
+    @NotNull
+    private static Map<Integer, String> findReturnPoints(@NotNull PsiMethod method) {
+        PsiCodeBlock body = method.getBody();
+        if (body == null) return Collections.emptyMap();
+
+        PsiFile file = method.getContainingFile();
+        Document document = file != null
+                ? PsiDocumentManager.getInstance(file.getProject()).getDocument(file)
+                : null;
+        if (document == null) return Collections.emptyMap();
+
+        Map<Integer, String> points = new LinkedHashMap<>();
+        body.accept(new JavaRecursiveElementWalkingVisitor() {
+            @Override
+            public void visitReturnStatement(@NotNull PsiReturnStatement statement) {
+                super.visitReturnStatement(statement);
+                PsiExpression returnExpr = statement.getReturnValue();
+                if (!(returnExpr instanceof PsiReferenceExpression)) return; // skip side-effect-prone forms
+                int line = document.getLineNumber(statement.getTextOffset());
+                points.put(line, returnExpr.getText());
+            }
+        });
+        return points;
     }
 
     /**
