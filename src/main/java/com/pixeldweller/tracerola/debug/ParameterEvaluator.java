@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ParameterEvaluator {
 
-    private static final long EVAL_TIMEOUT_MS = 3000;
+    private static final long EVAL_TIMEOUT_MS = 5000;
 
     /** Types that can be represented as a single Java literal. */
     private static final Set<String> SIMPLE_TYPES = Set.of(
@@ -210,8 +210,10 @@ public final class ParameterEvaluator {
      */
     @Nullable
     static String formatForCode(@Nullable String type, @NotNull String value) {
-        // Object references like "Todo@6910"
-        if (value.contains("@") && value.matches(".*@\\d+.*")) {
+        // Object references like "Todo@6910" or "Priority@6a3b" — any @hex tail.
+        // Returning null here forces the caller (MethodStepper) into the
+        // composite-return path so the object gets decomposed into fields.
+        if (value.matches(".*@[0-9a-fA-F]+.*")) {
             return null;
         }
 

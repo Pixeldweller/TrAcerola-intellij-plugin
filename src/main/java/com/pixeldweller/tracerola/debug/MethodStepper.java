@@ -5,16 +5,14 @@ import com.intellij.xdebugger.XDebugSession;
 import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XSourcePosition;
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator;
-import com.intellij.xdebugger.frame.*;
-import com.intellij.xdebugger.frame.presentation.XValuePresentation;
-import com.jetbrains.cef.remote.thrift.annotation.Nullable;
+import com.intellij.xdebugger.frame.XStackFrame;
+import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
 import com.pixeldweller.tracerola.model.TracedCall;
+import com.pixeldweller.tracerola.model.TracedCall.ReturnFieldSignature;
 import org.jetbrains.annotations.NotNull;
 
-import javax.swing.*;
+import java.util.ArrayList;
 import java.util.List;
-
-import static com.pixeldweller.tracerola.debug.ParameterEvaluator.extractValue;
 //import java.util.function.Runnable;
 
 /**
@@ -93,16 +91,16 @@ public final class MethodStepper {
             }
 
 //            // Capture return values for any dependency calls between previousLine and currentLine
-//            captureReturnValues(previousLine, currentLine);
+            //captureReturnValues(previousLine, currentLine);
 //
-//            previousLine = currentLine;
+          //previousLine = currentLine;
 
             // Continue stepping
             ApplicationManager.getApplication().invokeLater(() -> {
                 // kleiner Delay von 50ms, damit XValueTree vollständig geladen ist
                 ApplicationManager.getApplication().executeOnPooledThread(() -> {
-                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                    captureReturnValues(previousLine, currentLine);
+                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                    captureReturnValues(previousLine-1, currentLine-1);
                     previousLine = currentLine;
                     ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
                 });
@@ -128,6 +126,17 @@ public final class MethodStepper {
     /**
      * For each traced call whose line number falls between previousLine (exclusive)
      * and currentLine (inclusive), evaluate the resultVariable if one exists.
+     *
+     * <p>Three capture strategies, chosen by the return type metadata that
+     * {@link MethodTracer} pre-computed:
+     * <ol>
+     *   <li>Primitives / String → single expression eval + formatting.</li>
+     *   <li>Enums → {@code resultVar.name()} to get a clean constant name,
+     *       then emit as {@code Type.NAME}.</li>
+     *   <li>POJOs → evaluate each field as {@code resultVar.fieldName} and
+     *       store a list of {@link CapturedField}s for the generator to turn
+     *       into a {@code new + setters} block.</li>
+     * </ol>
      */
     private void captureReturnValues(int previousLine, int currentLine) {
         XStackFrame frame = session.getCurrentStackFrame();
@@ -136,86 +145,105 @@ public final class MethodStepper {
         if (evaluator == null) return;
 
         for (TracedCall call : calls) {
+
             int callLine = call.getLineNumber();
             if (callLine < 0) continue;
 
             // Was this call just stepped over?
-            if (callLine > previousLine && callLine <= currentLine) {
-                String resultVar = call.getResultVariable();
-                if (resultVar != null && !"void".equals(call.getReturnType())) {
+            if (callLine <= previousLine || callLine > currentLine) continue;
+            if ("void".equals(call.getReturnType())) continue;
 
-                    ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
-                    try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            String resultVar = call.getResultVariable();
+            if (resultVar == null) continue;
 
-                    // 1. Try variable (cheap, no side effects)
+            System.out.println("Call:"+call.getMethodName());
+            // 1. Try the cheap path — works for primitives, boxed types, String.
 
-                    String value = ParameterEvaluator.evaluateAndFormat(
-                                evaluator,
-                                call.getResultVariable()
-                    );
-
-
-                    // 2. Fallback: expression (reliable, but may re-execute)
-                    if (value == null) {
-                        XValue raw = ParameterEvaluator.evaluateRaw(
-                                evaluator,
-                                call.toExpression()
-                        );
-
-                        if (raw != null) {
-                            raw.computePresentation(new XValueNode() {
-                                @Override
-                                public void setPresentation(@Nullable Icon icon,
-                                                            @Nullable String type,
-                                                            @NotNull String value,
-                                                            boolean hasChildren) {
-
-                                    if (hasChildren) {
-                                        // 👉 it's an object → DON'T discard it
-                                        call.setCapturedReturnValue(type); // or keep null and expand later
-                                    } else {
-                                        String formatted = ParameterEvaluator.formatForCode(type, value);
-                                        call.setCapturedReturnValue(formatted);
-                                    }
-                                }
-
-                                @Override
-                                public void setPresentation(@Nullable Icon icon,
-                                                            @NotNull XValuePresentation presentation,
-                                                            boolean hasChildren) {
-
-                                    String rawVal = extractValue(presentation);
-
-                                    if (hasChildren) {
-                                        call.setCapturedReturnValue(presentation.getType());
-                                    } else {
-                                        String formatted = ParameterEvaluator.formatForCode(
-                                                presentation.getType(),
-                                                rawVal
-                                        );
-                                        call.setCapturedReturnValue(formatted);
-                                    }
-                                }
-
-                                @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator e) {}
-                                @Override public boolean isObsolete() { return false; }
-
-                            }, XValuePlace.TREE);
-                        }
-
-                        value = raw != null
-                                ? ParameterEvaluator.toDisplayString(raw)
-                                : null;
-                    }
-
-
-
-                    if (value != null) {
-                        call.setCapturedReturnValue(value);
-                    }
+            String simple = ParameterEvaluator.evaluateAndFormat(evaluator, resultVar);
+            if (simple != null && !simple.contains("Collecting data…")) {
+                call.setCapturedReturnValue(simple);
+                continue;
+            } else {
+//                ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
+//                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                simple = ParameterEvaluator.evaluateAndFormat(evaluator, resultVar);
+                if(simple != null && simple.contains("Collecting data…")){
+                    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                    simple = ParameterEvaluator.evaluateAndFormat(evaluator, resultVar);
+                }
+                if (simple != null) {
+                    call.setCapturedReturnValue(simple);
+                    continue;
                 }
             }
+
+            // 2. Enum — ask the debugger for the constant name directly.
+            if (call.isReturnTypeEnum()) {
+                String enumLiteral = evaluateEnumLiteral(evaluator, resultVar, call.getReturnType());
+                if (enumLiteral != null) {
+                    call.setCapturedReturnValue(enumLiteral);
+                } else {
+                    int maxTry = 1;
+                    while(enumLiteral == null && maxTry>0){
+                        maxTry--;
+//                        ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
+                        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                        enumLiteral = evaluateEnumLiteral(evaluator, resultVar, call.getReturnType());
+//                        if(enumLiteral != null && enumLiteral.contains("Collecting data…")){
+//                            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+//                            enumLiteral = evaluateEnumLiteral(evaluator, resultVar, call.getReturnType());
+//                        }
+                    }
+                    if (enumLiteral != null) {
+                        call.setCapturedReturnValue(enumLiteral);
+                    }
+                }
+                continue;
+            }
+
+            // 3. POJO — decompose into per-field captures using the pre-computed signatures.
+            List<ReturnFieldSignature> sigs = call.getReturnFieldSignatures();
+            if (!sigs.isEmpty()) {
+                List<CapturedField> captured = new ArrayList<>(sigs.size());
+                for (ReturnFieldSignature sig : sigs) {
+                    String fieldExpr = resultVar + "." + sig.fieldName();
+                    String val = ParameterEvaluator.evaluateAndFormat(evaluator, fieldExpr);
+
+                    if(val != null && val.contains("Collecting data…")){
+                        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                        val = ParameterEvaluator.evaluateAndFormat(evaluator, fieldExpr);
+                    }
+
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
+                }
+                call.setCapturedReturnFields(captured);
+            }
         }
+    }
+
+    /**
+     * Evaluates {@code resultVar.name()} on a paused debugger to get the enum
+     * constant name, then formats it as {@code ShortType.NAME} for the generator.
+     * Returns {@code null} on evaluation failure.
+     */
+    @org.jetbrains.annotations.Nullable
+    private static String evaluateEnumLiteral(@NotNull XDebuggerEvaluator evaluator,
+                                               @NotNull String resultVar,
+                                               @NotNull String declaredType) {
+        String nameLiteral = ParameterEvaluator.evaluateAndFormat(evaluator, resultVar + ".name()");
+        if (nameLiteral == null) return null;
+
+        // evaluateAndFormat wraps Strings in quotes — peel them back off.
+        String constantName = nameLiteral;
+        if (constantName.length() >= 2 && constantName.startsWith("\"") && constantName.endsWith("\"")) {
+            constantName = constantName.substring(1, constantName.length() - 1);
+        }
+        if (constantName.isEmpty()) return null;
+
+        String shortType = declaredType.contains(".")
+                ? declaredType.substring(declaredType.lastIndexOf('.') + 1)
+                : declaredType;
+        return shortType + "." + constantName;
     }
 
     private int currentLine() {

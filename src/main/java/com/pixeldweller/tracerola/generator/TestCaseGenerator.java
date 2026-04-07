@@ -73,17 +73,36 @@ public final class TestCaseGenerator {
                 .toList();
         if (!mockable.isEmpty()) {
             sb.append("    // Mock setup\n");
+            Set<String> usedReturnVars = new HashSet<>();
             for (TracedCall c : mockable) {
-                String returnValue = c.getMockReturnPlaceholder();
-                if(c.getCapturedReturnValue() != null){
+                String returnValue;
+                String traceComment = null;
+
+                if (c.hasCapturedReturnFields()) {
+                    // Composite POJO return — emit `new Type(); var.setX(...)` block, then use var in thenReturn.
+                    String varName = makeUniqueReturnVarName(c, usedReturnVars);
+                    sb.append("    ").append(c.getReturnType()).append(' ').append(varName)
+                      .append(" = new ").append(c.getReturnType()).append("(); // traced\n");
+                    for (CapturedParameter.CapturedField f : c.getCapturedReturnFields()) {
+                        if (f.value() != null) {
+                            sb.append("    ").append(varName).append('.')
+                              .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                        }
+                    }
+                    returnValue = varName;
+                } else if (c.getCapturedReturnValue() != null) {
                     returnValue = c.getCapturedReturnValue();
+                    traceComment = c.getCapturedReturnValue();
+                } else {
+                    returnValue = c.getMockReturnPlaceholder();
                 }
+
                 sb.append("    when(").append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
                   .append(String.join(", ", c.getArgExpressions()))
                   .append(")).thenReturn(").append(returnValue).append(");");
-                if (c.getCapturedReturnValue() != null) {
-                    sb.append(" // traced " + c.getCapturedReturnValue().toString());
+                if (traceComment != null) {
+                    sb.append(" // traced ").append(traceComment);
                 }
                 sb.append('\n');
             }
@@ -193,6 +212,21 @@ public final class TestCaseGenerator {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Builds a method-body-local variable name for a composite mock return value,
+     * ensuring no clash with other mocks in the same test. E.g. {@code suggestCategoryResult},
+     * {@code suggestCategoryResult2}, …
+     */
+    static String makeUniqueReturnVarName(@NotNull TracedCall call, @NotNull Set<String> used) {
+        String base = call.getMethodName() + "Result";
+        String candidate = base;
+        int i = 2;
+        while (!used.add(candidate)) {
+            candidate = base + i++;
+        }
+        return candidate;
+    }
 
     static String capitalize(String s) {
         if (s == null || s.isEmpty()) return s;

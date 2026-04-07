@@ -3,6 +3,7 @@ package com.pixeldweller.tracerola.debug;
 import com.intellij.openapi.editor.Document;
 import com.intellij.psi.*;
 import com.pixeldweller.tracerola.model.TracedCall;
+import com.pixeldweller.tracerola.model.TracedCall.ReturnFieldSignature;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -23,6 +24,17 @@ public final class MethodTracer {
 
     private static final Set<String> INJECTION_SUFFIXES = Set.of(
             "Autowired", "Inject", "Resource", "Mock", "MockBean", "SpyBean"
+    );
+
+    /** Types that should never be decomposed into fields for return-value capture. */
+    private static final Set<String> SIMPLE_RETURN_TYPES = Set.of(
+            "void",
+            "int", "long", "short", "byte", "float", "double", "boolean", "char",
+            "Integer", "Long", "Short", "Byte", "Float", "Double", "Boolean", "Character",
+            "String",
+            "java.lang.Integer", "java.lang.Long", "java.lang.Short", "java.lang.Byte",
+            "java.lang.Float", "java.lang.Double", "java.lang.Boolean", "java.lang.Character",
+            "java.lang.String"
     );
 
     private MethodTracer() {}
@@ -71,15 +83,20 @@ public final class MethodTracer {
                 }
 
                 String returnType = "Object";
+                PsiType resolvedReturnType = null;
                 PsiMethod resolved = expr.resolveMethod();
                 if (resolved != null && resolved.getReturnType() != null) {
-                    returnType = resolved.getReturnType().getPresentableText();
+                    resolvedReturnType = resolved.getReturnType();
+                    returnType = resolvedReturnType.getPresentableText();
                 }
 
                 PsiField field = injected.get(qualName);
                 String qualType = field.getType().getPresentableText();
 
                 TracedCall tc = new TracedCall(qualName, qualType, calledMethod, returnType, args);
+
+                // Composite / enum return-type metadata — used by the stepper + generator
+                populateReturnTypeMetadata(tc, resolvedReturnType);
 
                 // Line number
                 if (document != null) {
@@ -157,6 +174,35 @@ public final class MethodTracer {
         }
 
         return null;
+    }
+
+    /**
+     * Fills in enum-flag and (for POJOs) the list of writable-field signatures so
+     * the stepper can evaluate {@code resultVar.fieldName} for each one and the
+     * generator can emit {@code new Type(); obj.setField(...)} blocks.
+     */
+    private static void populateReturnTypeMetadata(@NotNull TracedCall tc, @Nullable PsiType returnType) {
+        if (returnType == null) return;
+        String presentable = returnType.getPresentableText();
+        if (SIMPLE_RETURN_TYPES.contains(presentable)) return;
+        if (!(returnType instanceof PsiClassType classType)) return;
+
+        PsiClass psiClass = classType.resolve();
+        if (psiClass == null) return;
+
+        if (psiClass.isEnum()) {
+            tc.setReturnTypeEnum(true);
+            return;
+        }
+
+        // POJO — collect instance fields (same shape as ParameterEvaluator.evaluateObjectFields)
+        List<ReturnFieldSignature> sigs = new ArrayList<>();
+        for (PsiField f : psiClass.getAllFields()) {
+            if (f.hasModifierProperty(PsiModifier.STATIC)) continue;
+            if (f.getName().startsWith("this$")) continue;
+            sigs.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText()));
+        }
+        tc.setReturnFieldSignatures(sigs);
     }
 
     private static boolean isInjected(PsiField field) {
