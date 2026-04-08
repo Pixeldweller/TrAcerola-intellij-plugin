@@ -28,7 +28,7 @@ intellijPlatform {
         }
 
         changeNotes = """
-            0.1-alpxha: Initial release — breakpoint-driven JUnit 5 + Mockito test skeleton
+            0.1-alpha: Initial release — breakpoint-driven JUnit 5 + Mockito test skeleton
             generator. Pause at a breakpoint, trigger TrAcerola, and get a ready-to-edit
             test case with auto-detected mocks for all @Autowired / @Inject dependencies.
         """.trimIndent()
