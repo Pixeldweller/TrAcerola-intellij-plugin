@@ -8,28 +8,46 @@ import java.util.List;
 /**
  * One element captured from a {@link java.util.Collection}-typed return value.
  *
- * <p>Mirrors the literal-vs-composite split used everywhere else in the model:
+ * <p>Three element shapes, mirroring the literal/composite split used everywhere
+ * else in the model plus an "unknown" escape hatch for heterogeneous lists:
  * <ul>
- *   <li>{@link #literal()} non-null → primitive, String, or enum element ({@code "42"}, {@code "Priority.HIGH"}).</li>
- *   <li>{@link #fields()} non-empty → POJO element decomposed into per-field values
- *       so the generator can emit {@code new + setters}.</li>
+ *   <li>{@link #literal()} non-null → primitive, String, or enum element
+ *       ({@code "42"}, {@code "Priority.HIGH"}).</li>
+ *   <li>{@link #fields()} non-empty → POJO element decomposed into per-field
+ *       values so the generator can emit {@code new + setters}.</li>
+ *   <li>{@link #runtimeType()} non-null with both other slots empty → the element
+ *       couldn't be decomposed against the declared element type (typically because
+ *       the list is declared as {@code List<Object>} or some interface and the
+ *       runtime element is a subclass with fields the tracer doesn't know about).
+ *       The generator emits this as a {@code TODO} comment with the runtime
+ *       class name so the user can fill it in by hand.</li>
  * </ul>
  *
- * <p>Both slots null/empty means the element couldn't be captured (e.g. evaluation
- * failed mid-list). The generator falls back to a TODO placeholder in that case.
+ * <p>If all three slots are empty/null, the element is treated as fully
+ * unrecoverable and the generator emits {@code add(null)}.
  */
-public record CapturedListElement(String literal, List<CapturedField> fields) {
+public record CapturedListElement(String literal, List<CapturedField> fields, String runtimeType) {
 
     public CapturedListElement {
         fields = fields != null ? List.copyOf(fields) : Collections.emptyList();
     }
 
     public static CapturedListElement ofLiteral(String literal) {
-        return new CapturedListElement(literal, Collections.emptyList());
+        return new CapturedListElement(literal, Collections.emptyList(), null);
     }
 
     public static CapturedListElement ofFields(List<CapturedField> fields) {
-        return new CapturedListElement(null, fields);
+        return new CapturedListElement(null, fields, null);
+    }
+
+    /**
+     * Element whose declared-type capture failed but whose runtime simple class
+     * name was successfully read via {@code element.getClass().getSimpleName()}.
+     * The generator emits this as a {@code TODO} marker so the user sees what
+     * was lost rather than having the element silently dropped.
+     */
+    public static CapturedListElement ofUnknown(String runtimeType) {
+        return new CapturedListElement(null, Collections.emptyList(), runtimeType);
     }
 
     public boolean isLiteral() {
@@ -38,5 +56,9 @@ public record CapturedListElement(String literal, List<CapturedField> fields) {
 
     public boolean isComposite() {
         return literal == null && !fields.isEmpty();
+    }
+
+    public boolean isUnknown() {
+        return literal == null && fields.isEmpty() && runtimeType != null;
     }
 }

@@ -315,6 +315,13 @@ public final class TestCaseGenerator {
                     }
                 }
                 sb.append(indent).append(varName).append(".add(").append(elemVar).append(");\n");
+            } else if (elem.isUnknown()) {
+                // Heterogeneous list — declared element type didn't have usable
+                // field signatures (e.g. List<Object>). Emit a placeholder add
+                // with the runtime type so the user knows what was lost.
+                sb.append(indent).append(varName).append(".add(null); // TODO element ").append(i)
+                  .append(": runtime type was ").append(elem.runtimeType())
+                  .append(" — declared element type couldn't decompose it\n");
             } else {
                 sb.append(indent).append(varName).append(".add(null); // TODO element ").append(i)
                   .append(" couldn't be captured\n");
@@ -351,6 +358,9 @@ public final class TestCaseGenerator {
                           .append(f.getterName()).append("());\n");
                     }
                 }
+            } else if (elem.isUnknown()) {
+                sb.append(indent).append("// TODO assert ").append(accessor)
+                  .append(": runtime type was ").append(elem.runtimeType()).append('\n');
             }
         }
     }

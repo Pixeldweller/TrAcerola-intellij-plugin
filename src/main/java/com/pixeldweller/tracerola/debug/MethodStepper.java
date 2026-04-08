@@ -322,9 +322,12 @@ public final class MethodStepper {
      * size couldn't be read (i.e. the expression didn't resolve to a list);
      * returns an empty list when the runtime list itself was empty.
      *
-     * <p>Element-level evaluation failures are tolerated: an unresolved element
-     * is dropped silently rather than failing the whole capture, so a single bad
-     * row in a result set doesn't blank the whole list.
+     * <p>When the per-element capture fails (e.g. {@code List<Object>} where the
+     * declared element type yields no field signatures), this method falls back
+     * to reading the runtime simple class name via {@code getClass().getSimpleName()}
+     * and stores it as an {@link CapturedListElement#ofUnknown unknown} element
+     * so the generator can surface it as a {@code TODO} marker. That keeps
+     * heterogeneous lists from silently losing rows.
      */
     @Nullable
     private static List<CapturedListElement> captureListElements(@NotNull XDebuggerEvaluator evaluator,
@@ -346,15 +349,43 @@ public final class MethodStepper {
         List<CapturedListElement> elements = new ArrayList<>(captureCount);
 
         for (int i = 0; i < captureCount; i++) {
-            CaptureResult elemResult = captureExpression(evaluator, expression + ".get(" + i + ")", elementSpec);
-            if (elemResult == null) continue;
-            if (elemResult.literal != null) {
+            String elementExpr = expression + ".get(" + i + ")";
+            CaptureResult elemResult = captureExpression(evaluator, elementExpr, elementSpec);
+            if (elemResult != null && elemResult.literal != null) {
                 elements.add(CapturedListElement.ofLiteral(elemResult.literal));
-            } else if (!elemResult.fields.isEmpty()) {
+                continue;
+            }
+            if (elemResult != null && !elemResult.fields.isEmpty()) {
                 elements.add(CapturedListElement.ofFields(elemResult.fields));
+                continue;
+            }
+
+            // Fall back to runtime-type detection so the user sees what was lost.
+            String runtimeType = evaluateRuntimeSimpleType(evaluator, elementExpr);
+            if (runtimeType != null) {
+                elements.add(CapturedListElement.ofUnknown(runtimeType));
             }
         }
         return elements;
+    }
+
+    /**
+     * Reads {@code expression.getClass().getSimpleName()} via the debugger and
+     * strips the surrounding quotes that {@link ParameterEvaluator#formatForCode}
+     * adds for String values. Returns {@code null} when the evaluation fails or
+     * the result isn't usable as an identifier.
+     */
+    @Nullable
+    private static String evaluateRuntimeSimpleType(@NotNull XDebuggerEvaluator evaluator,
+                                                    @NotNull String expression) {
+        String quoted = evaluateWithRetry(evaluator, expression + ".getClass().getSimpleName()");
+        if (quoted == null) return null;
+
+        String unquoted = quoted;
+        if (unquoted.length() >= 2 && unquoted.startsWith("\"") && unquoted.endsWith("\"")) {
+            unquoted = unquoted.substring(1, unquoted.length() - 1);
+        }
+        return unquoted.isEmpty() ? null : unquoted;
     }
 
     /** Stores a {@link CaptureResult} on the call, mapping each shape to the right slot. */
