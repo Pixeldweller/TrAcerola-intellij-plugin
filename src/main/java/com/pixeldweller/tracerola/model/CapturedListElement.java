@@ -41,6 +41,18 @@ public record CapturedListElement(String literal, List<CapturedField> fields, St
     }
 
     /**
+     * Composite element captured against a runtime class that wasn't the same
+     * as the declared element type — e.g. a {@code Notification} inside a
+     * {@code List<Object>}, or a {@code Cat} inside a {@code List<Animal>}.
+     * The generator uses {@link #runtimeType()} as the type for the
+     * {@code new ...()} expression instead of the declared element type, so
+     * subclass-specific fields aren't lost.
+     */
+    public static CapturedListElement ofRuntimeFields(String runtimeType, List<CapturedField> fields) {
+        return new CapturedListElement(null, fields, runtimeType);
+    }
+
+    /**
      * Element whose declared-type capture failed but whose runtime simple class
      * name was successfully read via {@code element.getClass().getSimpleName()}.
      * The generator emits this as a {@code TODO} marker so the user sees what

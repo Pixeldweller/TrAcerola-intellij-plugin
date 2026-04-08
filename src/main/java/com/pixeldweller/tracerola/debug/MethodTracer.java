@@ -377,9 +377,13 @@ public final class MethodTracer {
         return new ListShape(elementPresentable, false, collectInstanceFieldSignatures(elementClass));
     }
 
-    /** Non-static, non-synthetic instance fields of {@code psiClass} as signatures. */
+    /**
+     * Non-static, non-synthetic instance fields of {@code psiClass} as signatures.
+     * Package-private so {@link MethodStepper} can reuse it for runtime-class
+     * field discovery during list-element subclass dispatch.
+     */
     @NotNull
-    private static List<ReturnFieldSignature> collectInstanceFieldSignatures(@NotNull PsiClass psiClass) {
+    static List<ReturnFieldSignature> collectInstanceFieldSignatures(@NotNull PsiClass psiClass) {
         List<ReturnFieldSignature> sigs = new ArrayList<>();
         for (PsiField f : psiClass.getAllFields()) {
             if (f.hasModifierProperty(PsiModifier.STATIC)) continue;

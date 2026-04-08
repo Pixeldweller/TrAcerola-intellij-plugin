@@ -305,9 +305,13 @@ public final class TestCaseGenerator {
             if (elem.isLiteral()) {
                 sb.append(indent).append(varName).append(".add(").append(elem.literal()).append(");\n");
             } else if (elem.isComposite()) {
+                // Prefer the runtime type when subclass dispatch picked up a more
+                // specific class than the declared element type — that's the only
+                // way `new Cat()` shows up inside a `List<Animal>` etc.
+                String thisElemType = elem.runtimeType() != null ? elem.runtimeType() : elemTypeForNew;
                 String elemVar = makeUniqueElementVarName(varName, i, usedNames);
-                sb.append(indent).append(elemTypeForNew).append(' ').append(elemVar)
-                  .append(" = new ").append(elemTypeForNew).append("();\n");
+                sb.append(indent).append(thisElemType).append(' ').append(elemVar)
+                  .append(" = new ").append(thisElemType).append("();\n");
                 for (CapturedField f : elem.fields()) {
                     if (f.value() != null) {
                         sb.append(indent).append(elemVar).append('.')

@@ -1,6 +1,11 @@
 package com.pixeldweller.tracerola.debug;
 
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
+import com.intellij.psi.JavaPsiFacade;
+import com.intellij.psi.PsiClass;
+import com.intellij.psi.search.GlobalSearchScope;
 import com.intellij.xdebugger.XDebugSession;
 import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XSourcePosition;
@@ -16,7 +21,9 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Automatically steps over (F8) each line within a method, capturing the
@@ -75,6 +82,15 @@ public final class MethodStepper {
 
     /** Captured method return — element list for {@code List<E>} returns. */
     private List<CapturedListElement> capturedMethodReturnListElements = Collections.emptyList();
+
+    /**
+     * Per-trace cache of runtime FQN → field signatures, used by the list-element
+     * subclass dispatch path. Populated lazily the first time we see each runtime
+     * type so the PSI {@code findClass} round-trip happens at most once per class
+     * regardless of how many list elements share that type. Empty list means
+     * "lookup attempted but no usable PsiClass found" — sentinel to avoid retries.
+     */
+    private final Map<String, List<ReturnFieldSignature>> runtimeFieldSignatureCache = new HashMap<>();
 
     public MethodStepper(@NotNull XDebugSession session,
                          @NotNull List<TracedCall> calls,
@@ -281,11 +297,14 @@ public final class MethodStepper {
      *   <li>POJO — one eval per pre-computed field signature.</li>
      * </ol>
      * Returns {@code null} when nothing was captured (so a fallback can be tried).
+     *
+     * <p>Instance method (not static) because the list path needs access to the
+     * runtime field-signature cache for subclass dispatch.
      */
     @Nullable
-    private static CaptureResult captureExpression(@NotNull XDebuggerEvaluator evaluator,
-                                                   @NotNull String expression,
-                                                   @NotNull CaptureSpec spec) {
+    private CaptureResult captureExpression(@NotNull XDebuggerEvaluator evaluator,
+                                            @NotNull String expression,
+                                            @NotNull CaptureSpec spec) {
         if (spec.isList()) {
             List<CapturedListElement> elements = captureListElements(evaluator, expression, spec);
             return elements != null ? CaptureResult.list(elements) : null;
@@ -299,40 +318,20 @@ public final class MethodStepper {
             return enumLiteral != null ? CaptureResult.literal(enumLiteral) : null;
         }
 
-        if (!spec.fieldSignatures().isEmpty()) {
-            List<CapturedField> captured = new ArrayList<>(spec.fieldSignatures().size());
-            boolean anyValue = false;
-            for (ReturnFieldSignature sig : spec.fieldSignatures()) {
-                String val = evaluateWithRetry(evaluator, expression + "." + sig.fieldName());
-                if (val != null) anyValue = true;
-                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
-            }
-            // Only treat the POJO capture as successful if we actually got at
-            // least one field — otherwise the expression probably didn't resolve
-            // and the caller should be free to try its next fallback.
-            return anyValue ? CaptureResult.composite(captured) : null;
-        }
-        return null;
+        return capturePojoFields(evaluator, expression, spec.fieldSignatures());
     }
 
     /**
      * Captures the elements of a {@code List<E>} expression by reading
-     * {@code expression.size()} and then recursing on {@code expression.get(i)}
-     * with the element-shape {@link CaptureSpec}. Returns {@code null} when the
+     * {@code expression.size()} and then dispatching each {@code expression.get(i)}
+     * through {@link #captureSingleListElement}. Returns {@code null} when the
      * size couldn't be read (i.e. the expression didn't resolve to a list);
      * returns an empty list when the runtime list itself was empty.
-     *
-     * <p>When the per-element capture fails (e.g. {@code List<Object>} where the
-     * declared element type yields no field signatures), this method falls back
-     * to reading the runtime simple class name via {@code getClass().getSimpleName()}
-     * and stores it as an {@link CapturedListElement#ofUnknown unknown} element
-     * so the generator can surface it as a {@code TODO} marker. That keeps
-     * heterogeneous lists from silently losing rows.
      */
     @Nullable
-    private static List<CapturedListElement> captureListElements(@NotNull XDebuggerEvaluator evaluator,
-                                                                 @NotNull String expression,
-                                                                 @NotNull CaptureSpec spec) {
+    private List<CapturedListElement> captureListElements(@NotNull XDebuggerEvaluator evaluator,
+                                                          @NotNull String expression,
+                                                          @NotNull CaptureSpec spec) {
         String sizeStr = evaluateWithRetry(evaluator, expression + ".size()");
         if (sizeStr == null) return null;
 
@@ -349,36 +348,125 @@ public final class MethodStepper {
         List<CapturedListElement> elements = new ArrayList<>(captureCount);
 
         for (int i = 0; i < captureCount; i++) {
-            String elementExpr = expression + ".get(" + i + ")";
-            CaptureResult elemResult = captureExpression(evaluator, elementExpr, elementSpec);
-            if (elemResult != null && elemResult.literal != null) {
-                elements.add(CapturedListElement.ofLiteral(elemResult.literal));
-                continue;
-            }
-            if (elemResult != null && !elemResult.fields.isEmpty()) {
-                elements.add(CapturedListElement.ofFields(elemResult.fields));
-                continue;
-            }
-
-            // Fall back to runtime-type detection so the user sees what was lost.
-            String runtimeType = evaluateRuntimeSimpleType(evaluator, elementExpr);
-            if (runtimeType != null) {
-                elements.add(CapturedListElement.ofUnknown(runtimeType));
-            }
+            CapturedListElement captured = captureSingleListElement(
+                    evaluator, expression + ".get(" + i + ")", elementSpec);
+            if (captured != null) elements.add(captured);
         }
         return elements;
     }
 
     /**
-     * Reads {@code expression.getClass().getSimpleName()} via the debugger and
-     * strips the surrounding quotes that {@link ParameterEvaluator#formatForCode}
-     * adds for String values. Returns {@code null} when the evaluation fails or
-     * the result isn't usable as an identifier.
+     * Captures a single list element with full subclass dispatch:
+     * <ol>
+     *   <li>Cheap eval — primitives, String, enums; the {@link ParameterEvaluator}
+     *       formatting handles all three so we don't need any class info.</li>
+     *   <li>Runtime FQN lookup — read {@code element.getClass().getName()} so we
+     *       know what the element <em>actually</em> is, regardless of how the
+     *       list was declared.</li>
+     *   <li>PSI dispatch — resolve that FQN to a {@link PsiClass} via
+     *       {@link JavaPsiFacade} (in a read action) and collect its instance
+     *       fields. Cached per FQN so a 50-element {@code List<Animal>} of
+     *       Cats only does the lookup once.</li>
+     *   <li>Runtime-class capture — re-run per-field capture with the runtime
+     *       signatures. The result carries the runtime type so the generator
+     *       can emit {@code new Cat()} instead of {@code new Animal()}.</li>
+     *   <li>Declared-type fallback — only used when PSI couldn't resolve the
+     *       runtime FQN (e.g. JDK or third-party classes outside any source root).
+     *       Captures whatever fields the declared element type knows about.</li>
+     *   <li>Unknown marker — last resort, surfaces a {@code TODO} comment with
+     *       the runtime simple name so the user sees what was lost.</li>
+     * </ol>
      */
     @Nullable
-    private static String evaluateRuntimeSimpleType(@NotNull XDebuggerEvaluator evaluator,
-                                                    @NotNull String expression) {
-        String quoted = evaluateWithRetry(evaluator, expression + ".getClass().getSimpleName()");
+    private CapturedListElement captureSingleListElement(@NotNull XDebuggerEvaluator evaluator,
+                                                          @NotNull String elementExpr,
+                                                          @NotNull CaptureSpec elementSpec) {
+        // 1. Cheap eval — wins for primitives, String, enum literals.
+        String simple = evaluateWithRetry(evaluator, elementExpr);
+        if (simple != null) return CapturedListElement.ofLiteral(simple);
+
+        // 2. Runtime FQN — needed for both subclass dispatch and the fallback marker.
+        String runtimeFqn = evaluateRuntimeFqn(evaluator, elementExpr);
+        String runtimeSimple = runtimeFqn != null ? simpleNameOf(runtimeFqn) : null;
+
+        // 3 + 4. Try the runtime class's field signatures (cached per FQN).
+        if (runtimeFqn != null) {
+            List<ReturnFieldSignature> runtimeSigs = resolveRuntimeFieldSignatures(runtimeFqn);
+            if (!runtimeSigs.isEmpty()) {
+                CaptureResult res = capturePojoFields(evaluator, elementExpr, runtimeSigs);
+                if (res != null && !res.fields.isEmpty()) {
+                    return CapturedListElement.ofRuntimeFields(runtimeSimple, res.fields);
+                }
+            }
+        }
+
+        // 5. Declared-type fallback — useful when the runtime class isn't visible
+        //    via PSI (third-party / JDK types) but the declared type has fields.
+        if (!elementSpec.fieldSignatures().isEmpty()) {
+            CaptureResult res = capturePojoFields(evaluator, elementExpr, elementSpec.fieldSignatures());
+            if (res != null && !res.fields.isEmpty()) {
+                return CapturedListElement.ofFields(res.fields);
+            }
+        }
+
+        // 6. Unknown marker — at least surface the runtime type if we have it.
+        return runtimeSimple != null ? CapturedListElement.ofUnknown(runtimeSimple) : null;
+    }
+
+    /**
+     * Evaluates each field in {@code sigs} as {@code expression.fieldName} and
+     * bundles them into a {@link CaptureResult}. Returns {@code null} when no
+     * field came back with a value (so the caller knows to try a fallback).
+     */
+    @Nullable
+    private static CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
+                                                    @NotNull String expression,
+                                                    @NotNull List<ReturnFieldSignature> sigs) {
+        if (sigs.isEmpty()) return null;
+        List<CapturedField> captured = new ArrayList<>(sigs.size());
+        boolean anyValue = false;
+        for (ReturnFieldSignature sig : sigs) {
+            String val = evaluateWithRetry(evaluator, expression + "." + sig.fieldName());
+            if (val != null) anyValue = true;
+            captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
+        }
+        return anyValue ? CaptureResult.composite(captured) : null;
+    }
+
+    /**
+     * Looks up the field signatures of a runtime FQN via PSI, caching the result
+     * for the lifetime of this stepper. The PSI lookup happens inside a read
+     * action so it's safe to call from the pooled stepper thread.
+     *
+     * <p>An empty list is cached as a sentinel for "PSI couldn't find this class"
+     * (e.g. JDK types, classes from a jar that isn't on the project's source
+     * roots) so we don't repeatedly hammer {@code findClass} for the same miss.
+     */
+    @NotNull
+    private List<ReturnFieldSignature> resolveRuntimeFieldSignatures(@NotNull String fqn) {
+        return runtimeFieldSignatureCache.computeIfAbsent(fqn, qn -> {
+            Project project = session.getProject();
+            return ApplicationManager.getApplication().runReadAction(
+                    (Computable<List<ReturnFieldSignature>>) () -> {
+                        PsiClass cls = JavaPsiFacade.getInstance(project)
+                                .findClass(qn, GlobalSearchScope.allScope(project));
+                        return cls != null
+                                ? MethodTracer.collectInstanceFieldSignatures(cls)
+                                : Collections.emptyList();
+                    });
+        });
+    }
+
+    /**
+     * Reads {@code expression.getClass().getName()} via the debugger and strips
+     * the surrounding quotes that {@link ParameterEvaluator#formatForCode} adds
+     * for String values. Returns the FQN with {@code $} separators preserved
+     * (so inner-class lookups work) or {@code null} on failure.
+     */
+    @Nullable
+    private static String evaluateRuntimeFqn(@NotNull XDebuggerEvaluator evaluator,
+                                              @NotNull String expression) {
+        String quoted = evaluateWithRetry(evaluator, expression + ".getClass().getName()");
         if (quoted == null) return null;
 
         String unquoted = quoted;
@@ -386,6 +474,20 @@ public final class MethodStepper {
             unquoted = unquoted.substring(1, unquoted.length() - 1);
         }
         return unquoted.isEmpty() ? null : unquoted;
+    }
+
+    /**
+     * Extracts the simple class name from a JVM FQN. Handles inner classes by
+     * keeping only the part after the last {@code $} so {@code com.foo.Outer$Inner}
+     * becomes {@code Inner}. The result is what the generator emits in
+     * {@code new Foo()} expressions, so it must be a valid Java identifier.
+     */
+    @NotNull
+    private static String simpleNameOf(@NotNull String fqn) {
+        int dot = fqn.lastIndexOf('.');
+        String afterDot = dot < 0 ? fqn : fqn.substring(dot + 1);
+        int dollar = afterDot.lastIndexOf('$');
+        return dollar < 0 ? afterDot : afterDot.substring(dollar + 1);
     }
 
     /** Stores a {@link CaptureResult} on the call, mapping each shape to the right slot. */
