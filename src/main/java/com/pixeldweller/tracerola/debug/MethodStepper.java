@@ -6,6 +6,7 @@ import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XSourcePosition;
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator;
 import com.intellij.xdebugger.frame.XStackFrame;
+import com.pixeldweller.tracerola.model.CapturedListElement;
 import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
 import com.pixeldweller.tracerola.model.ReturnAnalysis;
 import com.pixeldweller.tracerola.model.TracedCall;
@@ -23,7 +24,7 @@ import java.util.List;
  *
  * <h3>Usage</h3>
  * <pre>
- * MethodStepper stepper = new MethodStepper(session, calls, startLine, endLine, onDone);
+ * MethodStepper stepper = new MethodStepper(session, calls, startLine, endLine, returnAnalysis, onDone);
  * stepper.start();
  * // ... onDone is called when the method exits or stepping finishes
  * </pre>
@@ -47,6 +48,9 @@ public final class MethodStepper {
     /** Extra wait when an evaluation comes back as IntelliJ's "Collecting data…" placeholder. */
     private static final long COLLECTING_RETRY_MS = 2000;
 
+    /** Hard cap on list-element captures so a {@code findAll()} of 100k rows doesn't hang the stepper. */
+    private static final int MAX_LIST_ELEMENTS = 50;
+
     /**
      * Substrings IntelliJ inserts while a value is still being computed. Both the
      * unicode-ellipsis form and the ASCII fallback are checked because both have
@@ -68,6 +72,9 @@ public final class MethodStepper {
 
     /** Captured method return — per-field decomposition for composite returns. */
     private List<CapturedField> capturedMethodReturnFields = Collections.emptyList();
+
+    /** Captured method return — element list for {@code List<E>} returns. */
+    private List<CapturedListElement> capturedMethodReturnListElements = Collections.emptyList();
 
     public MethodStepper(@NotNull XDebugSession session,
                          @NotNull List<TracedCall> calls,
@@ -94,6 +101,12 @@ public final class MethodStepper {
     @NotNull
     public List<CapturedField> getCapturedMethodReturnFields() {
         return capturedMethodReturnFields;
+    }
+
+    /** List elements captured at the executed return statement. Empty if none. */
+    @NotNull
+    public List<CapturedListElement> getCapturedMethodReturnListElements() {
+        return capturedMethodReturnListElements;
     }
 
     /**
@@ -170,7 +183,7 @@ public final class MethodStepper {
      * For each traced call whose line number falls in the just-stepped window,
      * evaluate the {@code resultVariable} if one exists.
      *
-     * <p>Three capture strategies, chosen by the return type metadata that
+     * <p>Four capture strategies, chosen by the return type metadata that
      * {@link MethodTracer} pre-computed:
      * <ol>
      *   <li>Primitives / String → single expression eval + formatting.</li>
@@ -179,6 +192,8 @@ public final class MethodStepper {
      *   <li>POJOs → evaluate each field as {@code resultVar.fieldName} and
      *       store a list of {@link CapturedField}s for the generator to turn
      *       into a {@code new + setters} block.</li>
+     *   <li>Lists → read {@code resultVar.size()} then recursively capture
+     *       each {@code resultVar.get(i)} as a literal/POJO element.</li>
      * </ol>
      *
      * <p>All evaluations go through {@link #evaluateWithRetry} so that the
@@ -199,21 +214,21 @@ public final class MethodStepper {
             if (callLine <= previousLine || callLine > currentLine) continue;
             if ("void".equals(call.getReturnType())) continue;
 
+            CaptureSpec spec = CaptureSpec.from(call);
+
             String resultVar = call.getResultVariable();
             if (resultVar != null) {
-                applyCapture(call, captureExpression(evaluator, resultVar,
-                        call.getReturnType(), call.isReturnTypeEnum(), call.getReturnFieldSignatures()));
+                applyCapture(call, captureExpression(evaluator, resultVar, spec));
                 continue;
             }
 
             // No local variable held the return value. Try the backtrace expressions
             // (e.g. target.getX() / target.isX() inferred from a setter pattern).
-            // Each candidate is tried via the full cheap→enum→POJO ladder; the
-            // first one that yields a value wins. Failures are silent — the
-            // evaluator already returns null for missing methods/getters.
+            // Each candidate is tried via the full capture ladder; the first one
+            // that yields a value wins. Failures are silent — the evaluator already
+            // returns null for missing methods/getters.
             for (String backtraceExpr : call.getBacktraceExpressions()) {
-                CaptureResult result = captureExpression(evaluator, backtraceExpr,
-                        call.getReturnType(), call.isReturnTypeEnum(), call.getReturnFieldSignatures());
+                CaptureResult result = captureExpression(evaluator, backtraceExpr, spec);
                 if (result != null) {
                     applyCapture(call, result);
                     break;
@@ -229,7 +244,9 @@ public final class MethodStepper {
      * return expression for this line.
      */
     private void captureMethodReturnIfApplicable(int currentLine) {
-        if (capturedMethodReturnValue != null || !capturedMethodReturnFields.isEmpty()) {
+        if (capturedMethodReturnValue != null
+                || !capturedMethodReturnFields.isEmpty()
+                || !capturedMethodReturnListElements.isEmpty()) {
             return; // already captured at an earlier return statement
         }
         String returnExpr = returnAnalysis.returnPoints().get(currentLine);
@@ -240,21 +257,25 @@ public final class MethodStepper {
         XDebuggerEvaluator evaluator = frame.getEvaluator();
         if (evaluator == null) return;
 
-        CaptureResult result = captureExpression(evaluator, returnExpr,
-                returnAnalysis.returnType(), returnAnalysis.isEnum(), returnAnalysis.fieldSignatures());
+        CaptureResult result = captureExpression(evaluator, returnExpr, CaptureSpec.from(returnAnalysis));
         if (result == null) return;
 
         if (result.literal != null) {
             capturedMethodReturnValue = result.literal;
         } else if (!result.fields.isEmpty()) {
             capturedMethodReturnFields = result.fields;
+        } else if (!result.listElements.isEmpty()) {
+            capturedMethodReturnListElements = result.listElements;
         }
     }
 
     /**
-     * Three-stage capture ladder shared by per-call resultVar capture, backtrace
-     * capture, and method-return capture:
+     * Capture ladder shared by per-call resultVar capture, backtrace capture,
+     * and method-return capture:
      * <ol>
+     *   <li>List — when {@code spec.isList()}, read {@code expression.size()}
+     *       then recurse on {@code expression.get(i)} for each element. Tried
+     *       first because list references would fail the cheap eval anyway.</li>
      *   <li>Cheap eval — wins for primitives, boxed types, and String.</li>
      *   <li>Enum — {@code expression.name()} formatted as {@code Type.NAME}.</li>
      *   <li>POJO — one eval per pre-computed field signature.</li>
@@ -264,23 +285,24 @@ public final class MethodStepper {
     @Nullable
     private static CaptureResult captureExpression(@NotNull XDebuggerEvaluator evaluator,
                                                    @NotNull String expression,
-                                                   @NotNull String declaredType,
-                                                   boolean isEnum,
-                                                   @NotNull List<ReturnFieldSignature> fieldSignatures) {
-        String simple = evaluateWithRetry(evaluator, expression);
-        if (simple != null) return new CaptureResult(simple, Collections.emptyList());
-
-        if (isEnum) {
-            String enumLiteral = evaluateEnumLiteralWithRetry(evaluator, expression, declaredType);
-            return enumLiteral != null
-                    ? new CaptureResult(enumLiteral, Collections.emptyList())
-                    : null;
+                                                   @NotNull CaptureSpec spec) {
+        if (spec.isList()) {
+            List<CapturedListElement> elements = captureListElements(evaluator, expression, spec);
+            return elements != null ? CaptureResult.list(elements) : null;
         }
 
-        if (!fieldSignatures.isEmpty()) {
-            List<CapturedField> captured = new ArrayList<>(fieldSignatures.size());
+        String simple = evaluateWithRetry(evaluator, expression);
+        if (simple != null) return CaptureResult.literal(simple);
+
+        if (spec.isEnum()) {
+            String enumLiteral = evaluateEnumLiteralWithRetry(evaluator, expression, spec.declaredType());
+            return enumLiteral != null ? CaptureResult.literal(enumLiteral) : null;
+        }
+
+        if (!spec.fieldSignatures().isEmpty()) {
+            List<CapturedField> captured = new ArrayList<>(spec.fieldSignatures().size());
             boolean anyValue = false;
-            for (ReturnFieldSignature sig : fieldSignatures) {
+            for (ReturnFieldSignature sig : spec.fieldSignatures()) {
                 String val = evaluateWithRetry(evaluator, expression + "." + sig.fieldName());
                 if (val != null) anyValue = true;
                 captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
@@ -288,28 +310,111 @@ public final class MethodStepper {
             // Only treat the POJO capture as successful if we actually got at
             // least one field — otherwise the expression probably didn't resolve
             // and the caller should be free to try its next fallback.
-            return anyValue ? new CaptureResult(null, captured) : null;
+            return anyValue ? CaptureResult.composite(captured) : null;
         }
         return null;
     }
 
-    /** Stores a {@link CaptureResult} on the call, mapping literal vs field-list to the right slot. */
+    /**
+     * Captures the elements of a {@code List<E>} expression by reading
+     * {@code expression.size()} and then recursing on {@code expression.get(i)}
+     * with the element-shape {@link CaptureSpec}. Returns {@code null} when the
+     * size couldn't be read (i.e. the expression didn't resolve to a list);
+     * returns an empty list when the runtime list itself was empty.
+     *
+     * <p>Element-level evaluation failures are tolerated: an unresolved element
+     * is dropped silently rather than failing the whole capture, so a single bad
+     * row in a result set doesn't blank the whole list.
+     */
+    @Nullable
+    private static List<CapturedListElement> captureListElements(@NotNull XDebuggerEvaluator evaluator,
+                                                                 @NotNull String expression,
+                                                                 @NotNull CaptureSpec spec) {
+        String sizeStr = evaluateWithRetry(evaluator, expression + ".size()");
+        if (sizeStr == null) return null;
+
+        int size;
+        try {
+            size = Integer.parseInt(sizeStr.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (size == 0) return Collections.emptyList();
+
+        int captureCount = Math.min(size, MAX_LIST_ELEMENTS);
+        CaptureSpec elementSpec = spec.asElement();
+        List<CapturedListElement> elements = new ArrayList<>(captureCount);
+
+        for (int i = 0; i < captureCount; i++) {
+            CaptureResult elemResult = captureExpression(evaluator, expression + ".get(" + i + ")", elementSpec);
+            if (elemResult == null) continue;
+            if (elemResult.literal != null) {
+                elements.add(CapturedListElement.ofLiteral(elemResult.literal));
+            } else if (!elemResult.fields.isEmpty()) {
+                elements.add(CapturedListElement.ofFields(elemResult.fields));
+            }
+        }
+        return elements;
+    }
+
+    /** Stores a {@link CaptureResult} on the call, mapping each shape to the right slot. */
     private static void applyCapture(@NotNull TracedCall call, @Nullable CaptureResult result) {
         if (result == null) return;
         if (result.literal != null) {
             call.setCapturedReturnValue(result.literal);
         } else if (!result.fields.isEmpty()) {
             call.setCapturedReturnFields(result.fields);
+        } else if (!result.listElements.isEmpty()) {
+            call.setCapturedReturnListElements(result.listElements);
         }
     }
 
-    /** Sum-type for {@link #captureExpression}: either a single literal or a list of field captures. */
+    /** Sum-type for {@link #captureExpression}: literal, single POJO, or list of elements. */
     private static final class CaptureResult {
         final String literal;
         final List<CapturedField> fields;
-        CaptureResult(String literal, List<CapturedField> fields) {
+        final List<CapturedListElement> listElements;
+
+        private CaptureResult(String literal, List<CapturedField> fields, List<CapturedListElement> listElements) {
             this.literal = literal;
             this.fields = fields;
+            this.listElements = listElements;
+        }
+
+        static CaptureResult literal(String l)              { return new CaptureResult(l, Collections.emptyList(), Collections.emptyList()); }
+        static CaptureResult composite(List<CapturedField> f) { return new CaptureResult(null, f, Collections.emptyList()); }
+        static CaptureResult list(List<CapturedListElement> e) { return new CaptureResult(null, Collections.emptyList(), e); }
+    }
+
+    /**
+     * Bundle of return-type metadata used to drive {@link #captureExpression}.
+     * Lets us produce a uniform spec from either a {@link TracedCall} (for
+     * dependency-call captures) or a {@link ReturnAnalysis} (for the method's
+     * own return) without dragging seven parameters through every call site.
+     */
+    private record CaptureSpec(
+            String declaredType,
+            boolean isEnum,
+            List<ReturnFieldSignature> fieldSignatures,
+            boolean isList,
+            String elementType,
+            boolean elementIsEnum,
+            List<ReturnFieldSignature> elementSignatures) {
+
+        /** Spec used when recursing into a single element of a list — list flags cleared. */
+        CaptureSpec asElement() {
+            return new CaptureSpec(elementType, elementIsEnum, elementSignatures,
+                    false, null, false, Collections.emptyList());
+        }
+
+        static CaptureSpec from(@NotNull TracedCall c) {
+            return new CaptureSpec(c.getReturnType(), c.isReturnTypeEnum(), c.getReturnFieldSignatures(),
+                    c.isReturnList(), c.getReturnElementType(), c.isReturnElementEnum(), c.getReturnElementSignatures());
+        }
+
+        static CaptureSpec from(@NotNull ReturnAnalysis a) {
+            return new CaptureSpec(a.returnType(), a.isEnum(), a.fieldSignatures(),
+                    a.isList(), a.elementType(), a.elementIsEnum(), a.elementFieldSignatures());
         }
     }
 

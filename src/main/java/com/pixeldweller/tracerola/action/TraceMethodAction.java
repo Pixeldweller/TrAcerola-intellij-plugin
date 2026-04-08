@@ -15,6 +15,7 @@ import com.pixeldweller.tracerola.debug.MethodStepper;
 import com.pixeldweller.tracerola.debug.MethodTracer;
 import com.pixeldweller.tracerola.debug.ParameterEvaluator;
 import com.pixeldweller.tracerola.generator.TestCaseGenerator;
+import com.pixeldweller.tracerola.model.CapturedListElement;
 import com.pixeldweller.tracerola.model.CapturedParameter;
 import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
 import com.pixeldweller.tracerola.model.ReturnAnalysis;
@@ -133,10 +134,12 @@ public class TraceMethodAction extends AnAction {
         ReturnAnalysis returnAnalysis = ApplicationManager.getApplication().runReadAction(
                 (Computable<ReturnAnalysis>) () -> MethodTracer.analyzeMethodReturn(method));
 
+        String returnElementType = returnAnalysis.elementType();
+
         if (lineRange == null) {
             // Can't determine line range — fall back to no-stepping mode
             buildAndShow(project, stateService, packageName, className, methodName,
-                    returnType, params, calls, null, List.of());
+                    returnType, returnElementType, params, calls, null, List.of(), List.of());
             return;
         }
 
@@ -146,9 +149,10 @@ public class TraceMethodAction extends AnAction {
         MethodStepper[] stepperHolder = new MethodStepper[1];
         Runnable onComplete = () -> ApplicationManager.getApplication().invokeLater(() ->
                 buildAndShow(project, stateService, packageName, className, methodName,
-                        returnType, params, calls,
+                        returnType, returnElementType, params, calls,
                         stepperHolder[0].getCapturedMethodReturnValue(),
-                        stepperHolder[0].getCapturedMethodReturnFields()));
+                        stepperHolder[0].getCapturedMethodReturnFields(),
+                        stepperHolder[0].getCapturedMethodReturnListElements()));
 
         stepperHolder[0] = new MethodStepper(
                 debugSession, calls, lineRange[0], lineRange[1], returnAnalysis, onComplete);
@@ -158,13 +162,15 @@ public class TraceMethodAction extends AnAction {
     private void buildAndShow(@NotNull Project project,
                               @NotNull TracerolaStateService stateService,
                               String packageName, String className, String methodName,
-                              String returnType, List<CapturedParameter> params,
+                              String returnType, String returnElementType,
+                              List<CapturedParameter> params,
                               List<TracedCall> calls,
                               String capturedReturnValue,
-                              List<CapturedField> capturedReturnFields) {
+                              List<CapturedField> capturedReturnFields,
+                              List<CapturedListElement> capturedReturnListElements) {
         TraceSession traceSession = new TraceSession(
-                packageName, className, methodName, returnType, params, calls,
-                capturedReturnValue, capturedReturnFields);
+                packageName, className, methodName, returnType, returnElementType, params, calls,
+                capturedReturnValue, capturedReturnFields, capturedReturnListElements);
         String code = TestCaseGenerator.generateFullClass(traceSession);
 
         stateService.addSession(traceSession, code);

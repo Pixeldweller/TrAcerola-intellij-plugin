@@ -60,6 +60,26 @@ public final class TracedCall {
      */
     private List<String> backtraceExpressions = Collections.emptyList();
 
+    // ---- List/Collection return metadata --------------------------------------
+    // Set by MethodTracer when the declared return type implements java.util.List.
+    // Phase 1 only supports List (clean .get(i) access + unambiguous ArrayList
+    // output); Set/Iterable can be added later if there's demand.
+
+    /** True when the declared return type is a {@code java.util.List}. */
+    private boolean returnList;
+
+    /** Element type's presentable name, e.g. "Todo" or "String". */
+    private String returnElementType;
+
+    /** True when the list element type is a Java enum. */
+    private boolean returnElementEnum;
+
+    /** Field signatures of the list element type when it's a POJO. */
+    private List<ReturnFieldSignature> returnElementSignatures = Collections.emptyList();
+
+    /** Runtime-captured list elements. Empty unless this call returns a List that was actually captured. */
+    private List<CapturedListElement> capturedReturnListElements = Collections.emptyList();
+
     public TracedCall(String qualifierName,
                       String qualifierType,
                       String methodName,
@@ -108,6 +128,30 @@ public final class TracedCall {
     public List<String> getBacktraceExpressions() { return backtraceExpressions; }
     public void setBacktraceExpressions(List<String> exprs) {
         this.backtraceExpressions = exprs != null ? List.copyOf(exprs) : Collections.emptyList();
+    }
+
+    public boolean isReturnList()           { return returnList; }
+    public void setReturnList(boolean v)    { this.returnList = v; }
+
+    public String getReturnElementType()    { return returnElementType; }
+    public void setReturnElementType(String t) { this.returnElementType = t; }
+
+    public boolean isReturnElementEnum()    { return returnElementEnum; }
+    public void setReturnElementEnum(boolean e) { this.returnElementEnum = e; }
+
+    public List<ReturnFieldSignature> getReturnElementSignatures() { return returnElementSignatures; }
+    public void setReturnElementSignatures(List<ReturnFieldSignature> sigs) {
+        this.returnElementSignatures = sigs != null ? List.copyOf(sigs) : Collections.emptyList();
+    }
+
+    public List<CapturedListElement> getCapturedReturnListElements() { return capturedReturnListElements; }
+    public void setCapturedReturnListElements(List<CapturedListElement> elements) {
+        this.capturedReturnListElements = elements != null ? List.copyOf(elements) : Collections.emptyList();
+    }
+
+    /** True when the call has captured list elements ready for emission. */
+    public boolean hasCapturedReturnListElements() {
+        return !capturedReturnListElements.isEmpty();
     }
 
     /**

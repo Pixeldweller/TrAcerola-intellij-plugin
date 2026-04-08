@@ -2,6 +2,7 @@ package com.pixeldweller.tracerola.debug;
 
 import com.intellij.openapi.editor.Document;
 import com.intellij.psi.*;
+import com.intellij.psi.util.InheritanceUtil;
 import com.pixeldweller.tracerola.model.ReturnAnalysis;
 import com.pixeldweller.tracerola.model.TracedCall;
 import com.pixeldweller.tracerola.model.TracedCall.ReturnFieldSignature;
@@ -244,26 +245,31 @@ public final class MethodTracer {
 
         boolean isEnum = false;
         List<ReturnFieldSignature> sigs = Collections.emptyList();
+        boolean isList = false;
+        String elementType = null;
+        boolean elementIsEnum = false;
+        List<ReturnFieldSignature> elementSigs = Collections.emptyList();
 
         if (!SIMPLE_RETURN_TYPES.contains(returnTypeText) && psiReturnType instanceof PsiClassType classType) {
             PsiClass psiClass = classType.resolve();
             if (psiClass != null) {
-                if (psiClass.isEnum()) {
+                ListShape listShape = analyzeListShape(classType, psiClass);
+                if (listShape != null) {
+                    isList = true;
+                    elementType = listShape.elementType;
+                    elementIsEnum = listShape.elementIsEnum;
+                    elementSigs = listShape.elementSignatures;
+                } else if (psiClass.isEnum()) {
                     isEnum = true;
                 } else {
-                    List<ReturnFieldSignature> tmp = new ArrayList<>();
-                    for (PsiField f : psiClass.getAllFields()) {
-                        if (f.hasModifierProperty(PsiModifier.STATIC)) continue;
-                        if (f.getName().startsWith("this$")) continue;
-                        tmp.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText()));
-                    }
-                    sigs = tmp;
+                    sigs = collectInstanceFieldSignatures(psiClass);
                 }
             }
         }
 
         Map<Integer, String> returnPoints = findReturnPoints(method);
-        return new ReturnAnalysis(returnTypeText, isEnum, sigs, returnPoints);
+        return new ReturnAnalysis(returnTypeText, isEnum, sigs, returnPoints,
+                isList, elementType, elementIsEnum, elementSigs);
     }
 
     /**
@@ -300,6 +306,10 @@ public final class MethodTracer {
      * Fills in enum-flag and (for POJOs) the list of writable-field signatures so
      * the stepper can evaluate {@code resultVar.fieldName} for each one and the
      * generator can emit {@code new Type(); obj.setField(...)} blocks.
+     *
+     * <p>If the return type implements {@code java.util.List}, also fills in the
+     * list-element metadata (element type, enum flag, element field signatures)
+     * so the stepper can decompose {@code list.get(i)} after the call executes.
      */
     private static void populateReturnTypeMetadata(@NotNull TracedCall tc, @Nullable PsiType returnType) {
         if (returnType == null) return;
@@ -310,20 +320,77 @@ public final class MethodTracer {
         PsiClass psiClass = classType.resolve();
         if (psiClass == null) return;
 
+        // List<E> takes precedence over generic POJO decomposition: a List is also
+        // a class with fields (size, elementData, …), but we never want to call
+        // setSize(...) — we want to populate elements via list.get(i).
+        ListShape listShape = analyzeListShape(classType, psiClass);
+        if (listShape != null) {
+            tc.setReturnList(true);
+            tc.setReturnElementType(listShape.elementType);
+            tc.setReturnElementEnum(listShape.elementIsEnum);
+            tc.setReturnElementSignatures(listShape.elementSignatures);
+            return;
+        }
+
         if (psiClass.isEnum()) {
             tc.setReturnTypeEnum(true);
             return;
         }
 
         // POJO — collect instance fields (same shape as ParameterEvaluator.evaluateObjectFields)
+        tc.setReturnFieldSignatures(collectInstanceFieldSignatures(psiClass));
+    }
+
+    /**
+     * Detects {@code List<E>}-shaped types and resolves the element shape
+     * (literal vs enum vs POJO field signatures). Returns {@code null} if the
+     * type isn't a List, the element type can't be determined, or the element
+     * type is itself an unsupported shape (e.g. nested generics).
+     */
+    @Nullable
+    private static ListShape analyzeListShape(@NotNull PsiClassType classType, @NotNull PsiClass psiClass) {
+        if (!InheritanceUtil.isInheritor(psiClass, "java.util.List")) return null;
+
+        PsiType[] params = classType.getParameters();
+        if (params.length != 1) return null;
+
+        PsiType elementType = params[0];
+        // Unwrap "? extends Foo" / "? super Foo" → take the bound; raw "?" yields null.
+        if (elementType instanceof PsiWildcardType wc) {
+            elementType = wc.getBound();
+            if (elementType == null) return null;
+        }
+
+        String elementPresentable = elementType.getPresentableText();
+        if (SIMPLE_RETURN_TYPES.contains(elementPresentable)) {
+            return new ListShape(elementPresentable, false, Collections.emptyList());
+        }
+
+        if (!(elementType instanceof PsiClassType elementClassType)) return null;
+        PsiClass elementClass = elementClassType.resolve();
+        if (elementClass == null) return null;
+
+        if (elementClass.isEnum()) {
+            return new ListShape(elementPresentable, true, Collections.emptyList());
+        }
+
+        return new ListShape(elementPresentable, false, collectInstanceFieldSignatures(elementClass));
+    }
+
+    /** Non-static, non-synthetic instance fields of {@code psiClass} as signatures. */
+    @NotNull
+    private static List<ReturnFieldSignature> collectInstanceFieldSignatures(@NotNull PsiClass psiClass) {
         List<ReturnFieldSignature> sigs = new ArrayList<>();
         for (PsiField f : psiClass.getAllFields()) {
             if (f.hasModifierProperty(PsiModifier.STATIC)) continue;
             if (f.getName().startsWith("this$")) continue;
             sigs.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText()));
         }
-        tc.setReturnFieldSignatures(sigs);
+        return sigs;
     }
+
+    /** Internal carrier for the result of {@link #analyzeListShape}. */
+    private record ListShape(String elementType, boolean elementIsEnum, List<ReturnFieldSignature> elementSignatures) {}
 
     private static boolean isInjected(PsiField field) {
         for (PsiAnnotation ann : field.getAnnotations()) {
