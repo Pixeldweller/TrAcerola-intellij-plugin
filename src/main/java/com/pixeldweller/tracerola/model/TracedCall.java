@@ -17,6 +17,12 @@ public final class TracedCall {
         public String setterName() {
             return "set" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         }
+        public String getterName() {
+            String suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+            boolean isBool = "boolean".equals(fieldType) || "Boolean".equals(fieldType)
+                    || "java.lang.Boolean".equals(fieldType);
+            return (isBool ? "is" : "get") + suffix;
+        }
     }
 
     private final String qualifierName; // e.g. "inventoryService"

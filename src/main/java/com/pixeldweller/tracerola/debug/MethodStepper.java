@@ -394,7 +394,8 @@ public final class MethodStepper {
 
         // Check if this is an opaque JDK type before trying POJO decomposition.
         // Prevents decomposing BigDecimal.intVal, Long.value, etc.
-        String runtimeFqn = evaluateRuntimeFqn(evaluator, expression);
+        String rawFqn = evaluateRuntimeFqn(evaluator, expression);
+        String runtimeFqn = rawFqn != null ? deproxyFqn(rawFqn) : null;
         if (runtimeFqn != null && OPAQUE_TYPES.contains(runtimeFqn)) {
             String opaqueVal = captureOpaqueType(evaluator, expression, runtimeFqn);
             return opaqueVal != null ? CaptureResult.literal(opaqueVal) : null;
@@ -498,7 +499,8 @@ public final class MethodStepper {
         if (simple != null) return CapturedListElement.ofLiteral(simple);
 
         // 2. Runtime FQN — needed for both subclass dispatch and the fallback marker.
-        String runtimeFqn = evaluateRuntimeFqn(evaluator, elementExpr);
+        String rawElemFqn = evaluateRuntimeFqn(evaluator, elementExpr);
+        String runtimeFqn = rawElemFqn != null ? deproxyFqn(rawElemFqn) : null;
         String runtimeSimple = runtimeFqn != null ? simpleNameOf(runtimeFqn) : null;
 
         // 3 + 4. Try the runtime class's field signatures (cached per FQN).
@@ -506,7 +508,8 @@ public final class MethodStepper {
             stateService.setTracingStatus("Resolving " + simpleNameOf(runtimeFqn) + "…");
             List<ReturnFieldSignature> runtimeSigs = resolveRuntimeFieldSignatures(runtimeFqn);
             if (!runtimeSigs.isEmpty()) {
-                CaptureResult res = capturePojoFields(evaluator, elementExpr, runtimeSigs);
+                boolean proxy = rawElemFqn != null && isProxyFqn(rawElemFqn);
+                CaptureResult res = capturePojoFields(evaluator, elementExpr, runtimeSigs, proxy);
                 if (res != null && !res.fields.isEmpty()) {
                     return CapturedListElement.ofRuntimeFields(runtimeSimple, res.fields);
                 }
@@ -537,7 +540,16 @@ public final class MethodStepper {
     private CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
                                             @NotNull String expression,
                                             @NotNull List<ReturnFieldSignature> sigs) {
-        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, expression);
+        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, expression, false);
+    }
+
+    /** Overload that allows caller to signal the expression is a proxy object. */
+    @Nullable
+    private CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
+                                            @NotNull String expression,
+                                            @NotNull List<ReturnFieldSignature> sigs,
+                                            boolean useGetters) {
+        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, expression, useGetters);
     }
 
     /**
@@ -565,13 +577,19 @@ public final class MethodStepper {
                                                       @NotNull String expression,
                                                       @NotNull List<ReturnFieldSignature> sigs,
                                                       int depth,
-                                                      @Nullable String varPath) {
+                                                      @Nullable String varPath,
+                                                      boolean useGetters) {
         if (sigs.isEmpty()) return null;
         List<CapturedField> captured = new ArrayList<>(sigs.size());
         boolean anyValue = false;
 
         for (ReturnFieldSignature sig : sigs) {
-            String fieldExpr = expression + "." + sig.fieldName();
+            // For Hibernate/CGLIB proxies, direct field access returns null
+            // because the proxy's inherited fields are uninitialized — use
+            // getter-based evaluation instead (the proxy intercepts getters).
+            String fieldExpr = useGetters
+                    ? expression + "." + sig.getterName() + "()"
+                    : expression + "." + sig.fieldName();
             String val = evaluateWithRetry(evaluator, fieldExpr);
 
             if (val != null) {
@@ -585,7 +603,8 @@ public final class MethodStepper {
             // First check: is this an opaque JDK type whose internals we should NOT
             // decompose? (e.g. Long, BigDecimal, LocalDateTime, String)
             // If so, try .toString() and format as a type-aware literal.
-            String runtimeFqn = evaluateRuntimeFqn(evaluator, fieldExpr);
+            String rawFieldFqn = evaluateRuntimeFqn(evaluator, fieldExpr);
+            String runtimeFqn = rawFieldFqn != null ? deproxyFqn(rawFieldFqn) : null;
             if (runtimeFqn != null && OPAQUE_TYPES.contains(runtimeFqn)) {
                 String opaqueVal = captureOpaqueType(evaluator, fieldExpr, runtimeFqn);
                 if (opaqueVal != null) {
@@ -629,6 +648,7 @@ public final class MethodStepper {
                 }
 
                 // New object — resolve runtime class and recurse
+                boolean fieldIsProxy = rawFieldFqn != null && isProxyFqn(rawFieldFqn);
                 if (runtimeFqn != null) {
                     String runtimeSimple = simpleNameOf(runtimeFqn);
                     List<ReturnFieldSignature> nestedSigs = resolveRuntimeFieldSignatures(runtimeFqn);
@@ -641,7 +661,7 @@ public final class MethodStepper {
                         objectIdentityRegistry.put(identity, nestedVarPath);
 
                         CaptureResult nested = capturePojoFieldsRecursive(
-                                evaluator, fieldExpr, nestedSigs, depth + 1, nestedVarPath);
+                                evaluator, fieldExpr, nestedSigs, depth + 1, nestedVarPath, fieldIsProxy);
                         if (nested != null && !nested.fields.isEmpty()) {
                             anyValue = true;
                             captured.add(CapturedField.ofNested(
@@ -818,6 +838,39 @@ public final class MethodStepper {
             unquoted = unquoted.substring(1, unquoted.length() - 1);
         }
         return unquoted.isEmpty() ? null : unquoted;
+    }
+
+    /** Returns true when the FQN looks like a runtime-generated proxy class. */
+    private static boolean isProxyFqn(@NotNull String fqn) {
+        return fqn.contains("$HibernateProxy$") || fqn.contains("$$EnhancerByCGLIB$$")
+                || fqn.contains("$$SpringCGLIB$$") || fqn.contains("$ByteBuddy$");
+    }
+
+    /**
+     * Strips Hibernate / CGLIB / ByteBuddy proxy suffixes from a runtime FQN
+     * so that e.g. {@code com.example.Author$HibernateProxy$s5YYfc73} becomes
+     * {@code com.example.Author}. This lets PSI resolve the real class's fields
+     * instead of the synthetic proxy internals.
+     */
+    @NotNull
+    private static String deproxyFqn(@NotNull String fqn) {
+        // Hibernate proxies: Foo$HibernateProxy$xxx
+        int idx = fqn.indexOf("$HibernateProxy$");
+        if (idx > 0) return fqn.substring(0, idx);
+
+        // CGLIB proxies: Foo$$EnhancerByCGLIB$$xxx
+        idx = fqn.indexOf("$$EnhancerByCGLIB$$");
+        if (idx > 0) return fqn.substring(0, idx);
+
+        // Spring CGLIB: Foo$$SpringCGLIB$$xxx
+        idx = fqn.indexOf("$$SpringCGLIB$$");
+        if (idx > 0) return fqn.substring(0, idx);
+
+        // ByteBuddy: Foo$ByteBuddy$xxx
+        idx = fqn.indexOf("$ByteBuddy$");
+        if (idx > 0) return fqn.substring(0, idx);
+
+        return fqn;
     }
 
     /**
