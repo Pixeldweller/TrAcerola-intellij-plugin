@@ -33,6 +33,10 @@ public final class TracerolaStateService {
     private final Map<TraceSession, String> generatedCode = new ConcurrentHashMap<>();
     private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
 
+    /** Current tracing status message, or {@code null} when idle. */
+    private volatile String tracingStatus;
+    private final List<Runnable> tracingListeners = new CopyOnWriteArrayList<>();
+
     public TracerolaStateService(Project project) {
         this.project = project;
     }
@@ -74,6 +78,37 @@ public final class TracerolaStateService {
 
     public void removeListener(@NotNull Runnable listener) {
         listeners.remove(listener);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tracing state
+    // -------------------------------------------------------------------------
+
+    /** Returns {@code true} when a trace is in progress. */
+    public boolean isTracing() {
+        return tracingStatus != null;
+    }
+
+    /** Returns the current status message, or {@code null} when idle. */
+    @Nullable
+    public String getTracingStatus() {
+        return tracingStatus;
+    }
+
+    /** Sets the tracing status message and notifies listeners. Pass {@code null} to clear. */
+    public void setTracingStatus(@Nullable String status) {
+        this.tracingStatus = status;
+        for (Runnable r : tracingListeners) {
+            r.run();
+        }
+    }
+
+    public void addTracingListener(@NotNull Runnable listener) {
+        tracingListeners.add(listener);
+    }
+
+    public void removeTracingListener(@NotNull Runnable listener) {
+        tracingListeners.remove(listener);
     }
 
     // -------------------------------------------------------------------------

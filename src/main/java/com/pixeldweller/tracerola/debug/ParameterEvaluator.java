@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ParameterEvaluator {
 
-    private static final long EVAL_TIMEOUT_MS = 5000;
+    private static final long EVAL_TIMEOUT_MS = 6000;
 
     /** Types that can be represented as a single Java literal. */
     private static final Set<String> SIMPLE_TYPES = Set.of(
@@ -71,8 +71,18 @@ public final class ParameterEvaluator {
             }
 
             if (isSimpleType(typeName)) {
-                // Primitives, wrappers, strings — evaluate directly
-                String value = evaluateAndFormat(evaluator, name);
+                // Primitives, wrappers, strings — evaluate directly.
+                // For boxed types, try unboxing first (e.g. bookId.longValue())
+                // because the debugger presents wrappers as object references
+                // like {Long@1234} which formatForCode rejects.
+                String unboxExpr = unboxExpression(typeName, name);
+                String value = null;
+                if (unboxExpr != null) {
+                    value = evaluateAndFormat(evaluator, unboxExpr);
+                }
+                if (value == null) {
+                    value = evaluateAndFormat(evaluator, name);
+                }
                 result.add(new CapturedParameter(name, typeName, value));
             } else if (isEnumType(p.getType())) {
                 // Enums — evaluate and format as EnumType.VALUE
@@ -191,6 +201,27 @@ public final class ParameterEvaluator {
         return SIMPLE_TYPES.contains(typeName);
     }
 
+    /**
+     * Returns an unboxing expression for wrapper types so we get a clean
+     * primitive presentation from the debugger (e.g. {@code bookId.longValue()})
+     * instead of an object reference like {@code {Long@1234}}.
+     * Returns {@code null} for primitives and String — they evaluate cleanly.
+     */
+    @Nullable
+    private static String unboxExpression(@NotNull String typeName, @NotNull String varName) {
+        return switch (typeName) {
+            case "Long", "java.lang.Long"         -> varName + ".longValue()";
+            case "Integer", "java.lang.Integer"   -> varName + ".intValue()";
+            case "Short", "java.lang.Short"       -> varName + ".shortValue()";
+            case "Byte", "java.lang.Byte"         -> varName + ".byteValue()";
+            case "Float", "java.lang.Float"       -> varName + ".floatValue()";
+            case "Double", "java.lang.Double"     -> varName + ".doubleValue()";
+            case "Boolean", "java.lang.Boolean"   -> varName + ".booleanValue()";
+            case "Character", "java.lang.Character" -> varName + ".charValue()";
+            default -> null;
+        };
+    }
+
     private static boolean isEnumType(@NotNull PsiType type) {
         PsiClass psiClass = resolveClass(type);
         return psiClass != null && psiClass.isEnum();
@@ -210,10 +241,11 @@ public final class ParameterEvaluator {
      */
     @Nullable
     static String formatForCode(@Nullable String type, @NotNull String value) {
-        // Object references like "Todo@6910" or "Priority@6a3b" — any @hex tail.
+        // Object references like "Todo@6910" or "Priority@6a3b" — unquoted @hex.
         // Returning null here forces the caller (MethodStepper) into the
         // composite-return path so the object gets decomposed into fields.
-        if (value.matches(".*@[0-9a-fA-F]+.*")) {
+        // Exclude quoted strings — they may contain @ in content (e.g. emails).
+        if (!value.startsWith("\"") && value.matches(".*@[0-9a-fA-F]+.*")) {
             return null;
         }
 
@@ -233,20 +265,21 @@ public final class ParameterEvaluator {
                         ? value.substring(1, value.length() - 1) : value;
                 yield "\"" + unquoted + "\"";
             }
-            case "char", "java.lang.Character" -> {
+            case "char", "Character", "java.lang.Character" -> {
                 String unquoted = value.startsWith("'") && value.endsWith("'")
                         ? value.substring(1, value.length() - 1) : value;
                 yield "'" + unquoted + "'";
             }
-            case "long", "java.lang.Long" ->
+            case "long", "Long", "java.lang.Long" ->
                     value.endsWith("L") || value.endsWith("l") ? value : value + "L";
-            case "float", "java.lang.Float" ->
+            case "float", "Float", "java.lang.Float" ->
                     value.endsWith("f") || value.endsWith("F") ? value : value + "f";
-            case "double", "java.lang.Double" ->
+            case "double", "Double", "java.lang.Double" ->
                     value.endsWith("d") || value.endsWith("D") ? value : value;
-            case "boolean", "java.lang.Boolean" -> value;
-            case "int", "java.lang.Integer", "short", "java.lang.Short",
-                 "byte", "java.lang.Byte" -> value;
+            case "boolean", "Boolean", "java.lang.Boolean" -> value;
+            case "int", "Integer", "java.lang.Integer",
+                 "short", "Short", "java.lang.Short",
+                 "byte", "Byte", "java.lang.Byte" -> value;
             default -> {
                 if (value.matches("[A-Z][A-Z0-9_]*")) {
                     String shortType = type.contains(".")

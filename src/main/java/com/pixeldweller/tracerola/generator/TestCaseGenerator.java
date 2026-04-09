@@ -37,7 +37,10 @@ public final class TestCaseGenerator {
     @NotNull
     public static String generateTestMethod(@NotNull TraceSession session) {
         StringBuilder sb = new StringBuilder();
-        String testName = "test" + capitalize(session.getMethodName()) + "_generated";
+        String testName = session.getThrownExceptionType() != null
+                ? "test" + capitalize(session.getMethodName()) + "_throws"
+                  + session.getThrownExceptionType() + "_generated"
+                : "test" + capitalize(session.getMethodName()) + "_generated";
 
         sb.append("@Test\n");
         sb.append("void ").append(testName).append("() {\n");
@@ -50,14 +53,9 @@ public final class TestCaseGenerator {
               .append(" at breakpoint\n");
             for (CapturedParameter p : session.getParameters()) {
                 if (p.isComposite()) {
-                    sb.append("    ").append(p.getType()).append(' ').append(p.getName())
-                      .append(" = new ").append(p.getType()).append("(); // traced\n");
-                    for (CapturedParameter.CapturedField f : p.getFields()) {
-                        if (f.value() != null) {
-                            sb.append("    ").append(p.getName()).append('.')
-                              .append(f.setterName()).append('(').append(f.value()).append(");\n");
-                        }
-                    }
+                    Set<String> paramUsedNames = new HashSet<>();
+                    appendCompositeConstruction(sb, "    ", p.getName(), p.getType(),
+                            p.getFields(), paramUsedNames);
                 } else {
                     sb.append("    ").append(p.getType()).append(' ').append(p.getName())
                       .append(" = ").append(p.getValueOrPlaceholder()).append(';');
@@ -89,16 +87,12 @@ public final class TestCaseGenerator {
                             c.getCapturedReturnListElements(), usedReturnVars);
                     returnValue = varName;
                 } else if (c.hasCapturedReturnFields()) {
-                    // Composite POJO return — emit `new Type(); var.setX(...)` block, then use var in thenReturn.
+                    // Composite POJO return — emit `new Type(); var.setX(...)` block.
+                    String emitType = c.getCapturedReturnRuntimeType() != null
+                            ? c.getCapturedReturnRuntimeType() : c.getReturnType();
                     String varName = makeUniqueReturnVarName(c, usedReturnVars);
-                    sb.append("    ").append(c.getReturnType()).append(' ').append(varName)
-                      .append(" = new ").append(c.getReturnType()).append("(); // traced\n");
-                    for (CapturedField f : c.getCapturedReturnFields()) {
-                        if (f.value() != null) {
-                            sb.append("    ").append(varName).append('.')
-                              .append(f.setterName()).append('(').append(f.value()).append(");\n");
-                        }
-                    }
+                    appendCompositeConstruction(sb, "    ", varName, emitType,
+                            c.getCapturedReturnFields(), usedReturnVars);
                     returnValue = varName;
                 } else if (c.getCapturedReturnValue() != null) {
                     returnValue = c.getCapturedReturnValue();
@@ -107,10 +101,18 @@ public final class TestCaseGenerator {
                     returnValue = c.getMockReturnPlaceholder();
                 }
 
+                // When runtime type differs from declared return type (e.g. Optional<Book> → Book),
+                // the thenReturn value may need wrapping (e.g. Optional.of(...)).
+                boolean needsWrapHint = c.getCapturedReturnRuntimeType() != null
+                        && !c.getReturnType().equals(c.getCapturedReturnRuntimeType())
+                        && c.hasCapturedReturnFields();
                 sb.append("    when(").append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
                   .append(String.join(", ", c.getArgExpressions()))
                   .append(")).thenReturn(").append(returnValue).append(");");
+                if (needsWrapHint) {
+                    sb.append(" // TODO: may need wrapping, e.g. Optional.of(").append(returnValue).append(")");
+                }
                 if (traceComment != null) {
                     sb.append(" // traced ").append(traceComment);
                 }
@@ -119,49 +121,56 @@ public final class TestCaseGenerator {
             sb.append('\n');
         }
 
-        // --- Execute ---
-        sb.append("    // Execute\n");
-        boolean returnsValue = !"void".equals(session.getReturnType());
-        if (returnsValue) {
-            sb.append("    ").append(session.getReturnType()).append(" result = ");
-        } else {
-            sb.append("    ");
-        }
-        sb.append(decapitalize(session.getClassName())).append('.').append(session.getMethodName()).append('(');
+        // --- Execute + Assert ---
         List<String> paramNames = session.getParameters().stream()
                 .map(CapturedParameter::getName).toList();
-        sb.append(String.join(", ", paramNames));
-        sb.append(");\n\n");
+        String invocation = decapitalize(session.getClassName()) + "."
+                + session.getMethodName() + "(" + String.join(", ", paramNames) + ")";
 
-        // --- Assertions ---
-        sb.append("    // Assert\n");
-        if (returnsValue) {
-            sb.append("    assertNotNull(result);\n");
+        if (session.getThrownExceptionType() != null) {
+            // Unhappy path — method threw an exception
+            sb.append("    // Execute & Assert — expects exception\n");
+            sb.append("    assertThrows(").append(session.getThrownExceptionType())
+              .append(".class, () ->\n");
+            sb.append("            ").append(invocation).append(");\n");
+        } else {
+            boolean returnsValue = !"void".equals(session.getReturnType());
 
-            // Captured-value assertions: prefer the most informative failure shape.
-            //   List<E>     → size + per-element (literal or per-field) assertions
-            //   composite   → per-field assertions on result
-            //   primitive   → single assertEquals on result
-            if (session.hasCapturedReturnListElements()) {
-                appendListAssertions(sb, "    ", "result", session.getCapturedReturnListElements());
-            } else if (session.hasCapturedReturnFields()) {
-                for (CapturedField f : session.getCapturedReturnFields()) {
-                    if (f.value() != null) {
-                        sb.append("    assertEquals(").append(f.value())
-                          .append(", result.").append(f.getterName()).append("());\n");
-                    }
-                }
-            } else if (session.getCapturedReturnValue() != null) {
-                sb.append("    assertEquals(").append(session.getCapturedReturnValue())
-                  .append(", result);\n");
+            sb.append("    // Execute\n");
+            if (returnsValue) {
+                sb.append("    ").append(session.getReturnType()).append(" result = ");
+            } else {
+                sb.append("    ");
             }
-        }
-        for (TracedCall c : session.getTracedCalls()) {
-            if ("void".equals(c.getReturnType())) {
-                sb.append("    verify(").append(c.getQualifierName()).append(").")
-                  .append(c.getMethodName()).append('(')
-                  .append(String.join(", ", c.getArgExpressions()))
-                  .append(");\n");
+            sb.append(invocation).append(";\n\n");
+
+            // --- Assertions ---
+            sb.append("    // Assert\n");
+            if (returnsValue) {
+                sb.append("    assertNotNull(result);\n");
+
+                // Captured-value assertions: prefer the most informative failure shape.
+                if (session.hasCapturedReturnListElements()) {
+                    appendListAssertions(sb, "    ", "result", session.getCapturedReturnListElements());
+                } else if (session.hasCapturedReturnFields()) {
+                    for (CapturedField f : session.getCapturedReturnFields()) {
+                        if (f.value() != null) {
+                            sb.append("    assertEquals(").append(f.value())
+                              .append(", result.").append(f.getterName()).append("());\n");
+                        }
+                    }
+                } else if (session.getCapturedReturnValue() != null) {
+                    sb.append("    assertEquals(").append(session.getCapturedReturnValue())
+                      .append(", result);\n");
+                }
+            }
+            for (TracedCall c : session.getTracedCalls()) {
+                if ("void".equals(c.getReturnType())) {
+                    sb.append("    verify(").append(c.getQualifierName()).append(").")
+                      .append(c.getMethodName()).append('(')
+                      .append(String.join(", ", c.getArgExpressions()))
+                      .append(");\n");
+                }
             }
         }
 
@@ -274,6 +283,70 @@ public final class TestCaseGenerator {
             candidate = listVar + "Elem" + index + "_" + (dedup++);
         }
         return candidate;
+    }
+
+    /**
+     * Emits a composite POJO construction block, recursively handling nested
+     * objects, back-references, and list-field references.
+     *
+     * <pre>
+     * Book findByIdResult = new Book(); // traced
+     * findByIdResult.setTitle("The Hobbit");
+     * Author findByIdResultAuthor = new Author(); // traced (nested)
+     * findByIdResultAuthor.setName("J.R.R. Tolkien");
+     * findByIdResultAuthor.getBooks().add(findByIdResult);
+     * findByIdResult.setAuthor(findByIdResultAuthor);
+     * </pre>
+     */
+    private static void appendCompositeConstruction(@NotNull StringBuilder sb,
+                                                     @NotNull String indent,
+                                                     @NotNull String varName,
+                                                     @NotNull String typeName,
+                                                     @NotNull List<CapturedField> fields,
+                                                     @NotNull Set<String> usedNames) {
+        sb.append(indent).append(typeName).append(' ').append(varName)
+          .append(" = new ").append(typeName).append("(); // traced\n");
+
+        // First pass: emit nested objects (they must be declared before being used in setters)
+        // Also collect deferred setter calls for nested/reference fields
+        List<String> deferredSetters = new ArrayList<>();
+
+        for (CapturedField f : fields) {
+            if(f.getterName().contains("Email")){
+                System.out.println("test");
+            }
+            if(f.getterName().contains("Name")){
+                System.out.println("test");
+            }
+            if (f.isNested()) {
+                // Nested composite — declare the nested variable first
+                String nestedVar = varName + capitalize(f.fieldName());
+                int dedup = 2;
+                while (!usedNames.add(nestedVar)) {
+                    nestedVar = varName + capitalize(f.fieldName()) + (dedup++);
+                }
+                appendCompositeConstruction(sb, indent, nestedVar,
+                        f.nestedRuntimeType(), f.nestedFields(), usedNames);
+                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + nestedVar + ");\n");
+            } else if (f.isReference()) {
+                // Back-reference to an already-declared variable
+                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + f.referenceTo() + ");\n");
+            } else if (f.hasListReferences()) {
+                // List field containing known objects — emit .getX().add(ref) for each
+                for (String ref : f.listElementReferences()) {
+                    deferredSetters.add(indent + varName + "." + f.listGetterName() + "().add(" + ref + ");\n");
+                }
+            } else if (f.value() != null) {
+                // Simple literal field
+                sb.append(indent).append(varName).append('.')
+                  .append(f.setterName()).append('(').append(f.value()).append(");\n");
+            }
+        }
+
+        // Second pass: emit deferred setters (nested object setters + references)
+        for (String setter : deferredSetters) {
+            sb.append(setter);
+        }
     }
 
     /**

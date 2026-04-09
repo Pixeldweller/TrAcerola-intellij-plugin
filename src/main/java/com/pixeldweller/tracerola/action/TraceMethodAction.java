@@ -116,11 +116,14 @@ public class TraceMethodAction extends AnAction {
 
         stateService.notify("Tracing " + className + "." + methodName + "()…",
                 NotificationType.INFORMATION);
+        stateService.setTracingStatus("Capturing parameters…");
 
         // Capture parameters (evaluates via debugger — needs read action for PSI)
         List<CapturedParameter> params = ApplicationManager.getApplication().runReadAction(
                 (Computable<List<CapturedParameter>>) () ->
                         ParameterEvaluator.evaluate(method, debugSession));
+
+        stateService.setTracingStatus("Analyzing dependency calls…");
 
         // Trace calls + get method line range (read action)
         List<TracedCall> calls = ApplicationManager.getApplication().runReadAction(
@@ -128,6 +131,8 @@ public class TraceMethodAction extends AnAction {
 
         int[] lineRange = ApplicationManager.getApplication().runReadAction(
                 (Computable<int[]>) () -> MethodTracer.getMethodLineRange(method));
+
+        stateService.setTracingStatus("Analyzing return type…");
 
         // Static analysis of the method's own return type — needed by the stepper
         // to capture the value the method actually returns at its return statement.
@@ -138,24 +143,30 @@ public class TraceMethodAction extends AnAction {
 
         if (lineRange == null) {
             // Can't determine line range — fall back to no-stepping mode
+            stateService.setTracingStatus("Generating test…");
             buildAndShow(project, stateService, packageName, className, methodName,
-                    returnType, returnElementType, params, calls, null, List.of(), List.of());
+                    returnType, returnElementType, params, calls, null, List.of(), List.of(), null);
             return;
         }
 
         // --- Start auto-stepping ---
+        stateService.setTracingStatus("Stepping through method…");
+
         // Holder lets the onComplete lambda reach back into the stepper for the
         // values it captured during stepping (chicken-and-egg with effectively-final).
         MethodStepper[] stepperHolder = new MethodStepper[1];
-        Runnable onComplete = () -> ApplicationManager.getApplication().invokeLater(() ->
+        Runnable onComplete = () -> ApplicationManager.getApplication().invokeLater(() -> {
+                stateService.setTracingStatus("Generating test…");
                 buildAndShow(project, stateService, packageName, className, methodName,
                         returnType, returnElementType, params, calls,
                         stepperHolder[0].getCapturedMethodReturnValue(),
                         stepperHolder[0].getCapturedMethodReturnFields(),
-                        stepperHolder[0].getCapturedMethodReturnListElements()));
+                        stepperHolder[0].getCapturedMethodReturnListElements(),
+                        stepperHolder[0].getThrownExceptionType());
+        });
 
         stepperHolder[0] = new MethodStepper(
-                debugSession, calls, lineRange[0], lineRange[1], returnAnalysis, onComplete);
+                debugSession, calls, lineRange[0], lineRange[1], returnAnalysis, stateService, onComplete);
         stepperHolder[0].start();
     }
 
@@ -167,13 +178,16 @@ public class TraceMethodAction extends AnAction {
                               List<TracedCall> calls,
                               String capturedReturnValue,
                               List<CapturedField> capturedReturnFields,
-                              List<CapturedListElement> capturedReturnListElements) {
+                              List<CapturedListElement> capturedReturnListElements,
+                              String thrownExceptionType) {
         TraceSession traceSession = new TraceSession(
                 packageName, className, methodName, returnType, returnElementType, params, calls,
-                capturedReturnValue, capturedReturnFields, capturedReturnListElements);
+                capturedReturnValue, capturedReturnFields, capturedReturnListElements,
+                thrownExceptionType);
         String code = TestCaseGenerator.generateFullClass(traceSession);
 
         stateService.addSession(traceSession, code);
+        stateService.setTracingStatus(null);
         new GeneratedTestDialog(project, traceSession, code).show();
     }
 }

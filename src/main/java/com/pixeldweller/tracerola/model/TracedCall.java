@@ -31,8 +31,23 @@ public final class TracedCall {
     /** Variable name the return value is assigned to (e.g. "result"), or null. */
     private String resultVariable;
 
+    /**
+     * True when this dependency call is the direct return expression of the method
+     * (e.g. {@code return orderRepository.save(order)}). Lets the stepper feed
+     * the method-return capture back into this call's mock return value.
+     */
+    private boolean inReturnPosition;
+
     /** Set after evaluation if the debugger captured the actual return value. */
     private String capturedReturnValue;
+
+    /**
+     * Runtime simple name of the captured return object (e.g. "Book" when the
+     * declared return type is "Optional&lt;T&gt;" or "S"). Set by the stepper when
+     * runtime-class dispatch resolves a more specific type. The generator uses
+     * this instead of the declared return type for {@code new ...() + setters}.
+     */
+    private String capturedReturnRuntimeType;
 
     /** True when the declared return type is a Java enum. */
     private boolean returnTypeEnum;
@@ -104,8 +119,14 @@ public final class TracedCall {
     public String getResultVariable()       { return resultVariable; }
     public void setResultVariable(String v) { this.resultVariable = v; }
 
+    public boolean isInReturnPosition()    { return inReturnPosition; }
+    public void setInReturnPosition(boolean v) { this.inReturnPosition = v; }
+
     public String getCapturedReturnValue()  { return capturedReturnValue; }
     public void setCapturedReturnValue(String v) { this.capturedReturnValue = v; }
+
+    public String getCapturedReturnRuntimeType()  { return capturedReturnRuntimeType; }
+    public void setCapturedReturnRuntimeType(String v) { this.capturedReturnRuntimeType = v; }
 
     public boolean isReturnTypeEnum()       { return returnTypeEnum; }
     public void setReturnTypeEnum(boolean e) { this.returnTypeEnum = e; }

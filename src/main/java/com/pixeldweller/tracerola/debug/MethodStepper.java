@@ -16,14 +16,11 @@ import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
 import com.pixeldweller.tracerola.model.ReturnAnalysis;
 import com.pixeldweller.tracerola.model.TracedCall;
 import com.pixeldweller.tracerola.model.TracedCall.ReturnFieldSignature;
+import com.pixeldweller.tracerola.service.TracerolaStateService;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Automatically steps over (F8) each line within a method, capturing the
@@ -53,7 +50,7 @@ public final class MethodStepper {
     private static final long SETTLE_MS = 1000;
 
     /** Extra wait when an evaluation comes back as IntelliJ's "Collecting data…" placeholder. */
-    private static final long COLLECTING_RETRY_MS = 2000;
+    private static final long COLLECTING_RETRY_MS = 1500;
 
     /** Hard cap on list-element captures so a {@code findAll()} of 100k rows doesn't hang the stepper. */
     private static final int MAX_LIST_ELEMENTS = 50;
@@ -70,15 +67,22 @@ public final class MethodStepper {
     private final int methodStartLine; // 0-based inclusive
     private final int methodEndLine;   // 0-based inclusive
     private final ReturnAnalysis returnAnalysis;
+    private final TracerolaStateService stateService;
     private final Runnable onComplete;
 
     private int previousLine;
+
+    /** Exception type when the method exits via a {@code throw} statement (e.g. "IllegalStateException"). */
+    private String thrownExceptionType;
 
     /** Captured method return — primitive/string/enum literal, or null. */
     private String capturedMethodReturnValue;
 
     /** Captured method return — per-field decomposition for composite returns. */
     private List<CapturedField> capturedMethodReturnFields = Collections.emptyList();
+
+    /** Runtime type of the method return when resolved via runtime dispatch. */
+    private String capturedMethodReturnRuntimeType;
 
     /** Captured method return — element list for {@code List<E>} returns. */
     private List<CapturedListElement> capturedMethodReturnListElements = Collections.emptyList();
@@ -92,19 +96,60 @@ public final class MethodStepper {
      */
     private final Map<String, List<ReturnFieldSignature>> runtimeFieldSignatureCache = new HashMap<>();
 
+    /** Max nesting depth for recursive POJO capture (Book → Author → stop). */
+    private static final int MAX_NESTING_DEPTH = 2;
+
+    /**
+     * JDK types whose internals should never be decomposed. For these types,
+     * capture via {@code .toString()} and format as a type-aware literal instead
+     * of recursing into private fields like {@code intVal}, {@code coder}, etc.
+     */
+    private static final Set<String> OPAQUE_TYPES = Set.of(
+            // Boxed primitives
+            "java.lang.Long", "java.lang.Integer", "java.lang.Short", "java.lang.Byte",
+            "java.lang.Float", "java.lang.Double", "java.lang.Boolean", "java.lang.Character",
+            "java.lang.String",
+            // Math
+            "java.math.BigDecimal", "java.math.BigInteger",
+            // Date/Time
+            "java.time.LocalDate", "java.time.LocalTime", "java.time.LocalDateTime",
+            "java.time.ZonedDateTime", "java.time.Instant", "java.time.Duration",
+            "java.time.Period", "java.time.OffsetDateTime",
+            // Other common value types
+            "java.util.UUID", "java.util.Date", "java.sql.Timestamp",
+            "java.net.URL", "java.net.URI"
+    );
+
+    /**
+     * Identity registry: maps {@code System.identityHashCode(obj)} to the variable
+     * path assigned to that object (e.g. "findByIdResult", "findByIdResultAuthor").
+     * Used to detect cycles in bidirectional JPA relationships.
+     */
+    private final Map<String, String> objectIdentityRegistry = new HashMap<>();
+
+    private int stepCount;
+
     public MethodStepper(@NotNull XDebugSession session,
                          @NotNull List<TracedCall> calls,
                          int methodStartLine,
                          int methodEndLine,
                          @NotNull ReturnAnalysis returnAnalysis,
+                         @NotNull TracerolaStateService stateService,
                          @NotNull Runnable onComplete) {
         this.session = session;
         this.calls = calls;
         this.methodStartLine = methodStartLine;
         this.methodEndLine = methodEndLine;
         this.returnAnalysis = returnAnalysis;
+        this.stateService = stateService;
         this.onComplete = onComplete;
         this.previousLine = currentLine();
+    }
+
+    /** Exception type if the method exited via {@code throw}, or {@code null}. */
+    @Nullable
+    public String getThrownExceptionType() {
+        return thrownExceptionType;
     }
 
     /** Literal captured at the executed return statement, or {@code null}. */
@@ -158,6 +203,9 @@ public final class MethodStepper {
             // and the actual stepOver() must be re-dispatched onto the EDT afterwards.
             ApplicationManager.getApplication().invokeLater(() -> {
                 ApplicationManager.getApplication().executeOnPooledThread(() -> {
+                    stepCount++;
+                    stateService.setTracingStatus("Stepping… (line " + (currentLine + 1) + ")");
+
                     // Give the XValueTree a moment to settle before evaluating result vars.
                     sleepQuietly(SETTLE_MS);
 
@@ -165,6 +213,7 @@ public final class MethodStepper {
                     // pauses on the *next* statement to be executed, so a call on line N is
                     // only "done" once we've moved off it. Shifting the window back by one
                     // makes the inclusion test fire after the call has actually executed.
+                    stateService.setTracingStatus("Capturing return values… (line " + (currentLine + 1) + ")");
                     captureReturnValues(previousLine - 1, currentLine - 1);
 
                     // Method-return capture uses the *unshifted* current line, because
@@ -172,8 +221,13 @@ public final class MethodStepper {
                     // statement, before the next stepOver leaves the method.
                     captureMethodReturnIfApplicable(currentLine);
 
+                    // Throw detection — check if we're paused at a throw statement.
+                    // The next stepOver will leave the method via the exception.
+                    detectThrowIfApplicable(currentLine);
+
                     previousLine = currentLine;
 
+                    stateService.setTracingStatus("Stepping… (step " + stepCount + ")");
                     ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
                 });
             });
@@ -191,6 +245,9 @@ public final class MethodStepper {
 
         private void finish() {
             session.removeSessionListener(this);
+            // If any traced call was in a return position (e.g. return repo.save(order)),
+            // propagate the method-return capture to that call's mock return value.
+            feedReturnPositionCalls();
             onComplete.run();
         }
     }
@@ -234,16 +291,17 @@ public final class MethodStepper {
 
             String resultVar = call.getResultVariable();
             if (resultVar != null) {
+                // Register the object identity before capturing, so nested fields
+                // can reference back to it (e.g. author.books[0] → this book).
+                registerObjectIdentity(evaluator, resultVar, resultVar);
                 applyCapture(call, captureExpression(evaluator, resultVar, spec));
                 continue;
             }
 
             // No local variable held the return value. Try the backtrace expressions
             // (e.g. target.getX() / target.isX() inferred from a setter pattern).
-            // Each candidate is tried via the full capture ladder; the first one
-            // that yields a value wins. Failures are silent — the evaluator already
-            // returns null for missing methods/getters.
             for (String backtraceExpr : call.getBacktraceExpressions()) {
+                registerObjectIdentity(evaluator, backtraceExpr, backtraceExpr);
                 CaptureResult result = captureExpression(evaluator, backtraceExpr, spec);
                 if (result != null) {
                     applyCapture(call, result);
@@ -268,6 +326,8 @@ public final class MethodStepper {
         String returnExpr = returnAnalysis.returnPoints().get(currentLine);
         if (returnExpr == null) return;
 
+        stateService.setTracingStatus("Capturing method return value…");
+
         XStackFrame frame = session.getCurrentStackFrame();
         if (frame == null) return;
         XDebuggerEvaluator evaluator = frame.getEvaluator();
@@ -280,8 +340,22 @@ public final class MethodStepper {
             capturedMethodReturnValue = result.literal;
         } else if (!result.fields.isEmpty()) {
             capturedMethodReturnFields = result.fields;
+            capturedMethodReturnRuntimeType = result.runtimeType;
         } else if (!result.listElements.isEmpty()) {
             capturedMethodReturnListElements = result.listElements;
+        }
+    }
+
+    /**
+     * Checks if the current line is a {@code throw} statement. If so, records
+     * the exception type. The stepper will leave the method on the next stepOver.
+     */
+    private void detectThrowIfApplicable(int currentLine) {
+        if (thrownExceptionType != null) return; // already detected
+        String exType = returnAnalysis.throwPoints().get(currentLine);
+        if (exType != null) {
+            thrownExceptionType = exType;
+            stateService.setTracingStatus("Exception detected: " + exType);
         }
     }
 
@@ -318,7 +392,31 @@ public final class MethodStepper {
             return enumLiteral != null ? CaptureResult.literal(enumLiteral) : null;
         }
 
-        return capturePojoFields(evaluator, expression, spec.fieldSignatures());
+        // Check if this is an opaque JDK type before trying POJO decomposition.
+        // Prevents decomposing BigDecimal.intVal, Long.value, etc.
+        String runtimeFqn = evaluateRuntimeFqn(evaluator, expression);
+        if (runtimeFqn != null && OPAQUE_TYPES.contains(runtimeFqn)) {
+            String opaqueVal = captureOpaqueType(evaluator, expression, runtimeFqn);
+            return opaqueVal != null ? CaptureResult.literal(opaqueVal) : null;
+        }
+
+        // Try declared-type field signatures first.
+        CaptureResult pojoResult = capturePojoFields(evaluator, expression, spec.fieldSignatures());
+        if (pojoResult != null) return pojoResult;
+
+        // Fallback: runtime-class dispatch. The declared type may be wrong
+        // (e.g. Optional when the variable holds Book after .orElseThrow()),
+        // generic (S extends T), or simply have no field signatures.
+        if (runtimeFqn != null) {
+            List<ReturnFieldSignature> runtimeSigs = resolveRuntimeFieldSignatures(runtimeFqn);
+            if (!runtimeSigs.isEmpty()) {
+                CaptureResult runtimeResult = capturePojoFields(evaluator, expression, runtimeSigs);
+                if (runtimeResult != null && !runtimeResult.fields.isEmpty()) {
+                    return CaptureResult.compositeRuntime(runtimeResult.fields, simpleNameOf(runtimeFqn));
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -348,6 +446,7 @@ public final class MethodStepper {
         List<CapturedListElement> elements = new ArrayList<>(captureCount);
 
         for (int i = 0; i < captureCount; i++) {
+            stateService.setTracingStatus("Capturing list element " + (i + 1) + "/" + captureCount + "…");
             CapturedListElement captured = captureSingleListElement(
                     evaluator, expression + ".get(" + i + ")", elementSpec);
             if (captured != null) elements.add(captured);
@@ -391,6 +490,7 @@ public final class MethodStepper {
 
         // 3 + 4. Try the runtime class's field signatures (cached per FQN).
         if (runtimeFqn != null) {
+            stateService.setTracingStatus("Resolving " + simpleNameOf(runtimeFqn) + "…");
             List<ReturnFieldSignature> runtimeSigs = resolveRuntimeFieldSignatures(runtimeFqn);
             if (!runtimeSigs.isEmpty()) {
                 CaptureResult res = capturePojoFields(evaluator, elementExpr, runtimeSigs);
@@ -417,20 +517,251 @@ public final class MethodStepper {
      * Evaluates each field in {@code sigs} as {@code expression.fieldName} and
      * bundles them into a {@link CaptureResult}. Returns {@code null} when no
      * field came back with a value (so the caller knows to try a fallback).
+     *
+     * <p>Delegates to {@link #capturePojoFieldsRecursive} with depth 0.
      */
     @Nullable
-    private static CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
-                                                    @NotNull String expression,
-                                                    @NotNull List<ReturnFieldSignature> sigs) {
+    private CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
+                                            @NotNull String expression,
+                                            @NotNull List<ReturnFieldSignature> sigs) {
+        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, null);
+    }
+
+    /**
+     * Recursive POJO field capture with identity-based cycle detection.
+     *
+     * <p>When a field evaluates to an object reference (null from formatForCode),
+     * this method:
+     * <ol>
+     *   <li>Reads {@code System.identityHashCode(expr.field)} for the identity.</li>
+     *   <li>If the identity is already in {@link #objectIdentityRegistry} →
+     *       emits a {@link CapturedField#ofReference} pointing to the existing variable.</li>
+     *   <li>If not seen and {@code depth < MAX_NESTING_DEPTH} → resolves the
+     *       runtime class, recurses into its fields, stores as
+     *       {@link CapturedField#ofNested}.</li>
+     *   <li>For list-typed fields → reads element identities and emits
+     *       {@link CapturedField#ofListReferences} for known objects.</li>
+     * </ol>
+     *
+     * @param varPath the variable path for the object being captured (e.g. "findByIdResult"),
+     *                used to build nested variable names. Null at the top level (the caller
+     *                registers the identity before calling).
+     */
+    @Nullable
+    private CaptureResult capturePojoFieldsRecursive(@NotNull XDebuggerEvaluator evaluator,
+                                                      @NotNull String expression,
+                                                      @NotNull List<ReturnFieldSignature> sigs,
+                                                      int depth,
+                                                      @Nullable String varPath) {
         if (sigs.isEmpty()) return null;
         List<CapturedField> captured = new ArrayList<>(sigs.size());
         boolean anyValue = false;
+
         for (ReturnFieldSignature sig : sigs) {
-            String val = evaluateWithRetry(evaluator, expression + "." + sig.fieldName());
-            if (val != null) anyValue = true;
-            captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
+            String fieldExpr = expression + "." + sig.fieldName();
+            String val = evaluateWithRetry(evaluator, fieldExpr);
+
+            if (val != null) {
+                // Literal field — primitives, String, enum, etc.
+                anyValue = true;
+                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
+                continue;
+            }
+
+            // Field evaluated to null from formatForCode — it's an object reference.
+            // First check: is this an opaque JDK type whose internals we should NOT
+            // decompose? (e.g. Long, BigDecimal, LocalDateTime, String)
+            // If so, try .toString() and format as a type-aware literal.
+            String runtimeFqn = evaluateRuntimeFqn(evaluator, fieldExpr);
+            if (runtimeFqn != null && OPAQUE_TYPES.contains(runtimeFqn)) {
+                String opaqueVal = captureOpaqueType(evaluator, fieldExpr, runtimeFqn);
+                if (opaqueVal != null) {
+                    anyValue = true;
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), opaqueVal));
+                } else {
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                }
+                continue;
+            }
+
+            // Try identity-based recursion if we haven't hit the depth limit.
+            if (depth >= MAX_NESTING_DEPTH) {
+                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                continue;
+            }
+
+            // Check if this field is a list (try .size())
+            String sizeStr = evaluateWithRetry(evaluator, fieldExpr + ".size()");
+            if (sizeStr != null) {
+                // It's a list — check element identities for back-references
+                CapturedField listField = captureListFieldReferences(evaluator, fieldExpr, sig, sizeStr);
+                if (listField != null) {
+                    anyValue = true;
+                    captured.add(listField);
+                } else {
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                }
+                continue;
+            }
+
+            // Scalar object field — check identity
+            String identity = evaluateIdentity(evaluator, fieldExpr);
+            if (identity != null) {
+                String existingVar = objectIdentityRegistry.get(identity);
+                if (existingVar != null) {
+                    // Back-reference to an already-captured object
+                    anyValue = true;
+                    captured.add(CapturedField.ofReference(sig.fieldName(), sig.fieldType(), existingVar));
+                    continue;
+                }
+
+                // New object — resolve runtime class and recurse
+                if (runtimeFqn != null) {
+                    String runtimeSimple = simpleNameOf(runtimeFqn);
+                    List<ReturnFieldSignature> nestedSigs = resolveRuntimeFieldSignatures(runtimeFqn);
+                    if (!nestedSigs.isEmpty()) {
+                        // Build the nested variable name
+                        String nestedVarPath = (varPath != null ? varPath : "obj")
+                                + Character.toUpperCase(sig.fieldName().charAt(0))
+                                + sig.fieldName().substring(1);
+                        // Register identity BEFORE recursing (so children can reference it)
+                        objectIdentityRegistry.put(identity, nestedVarPath);
+
+                        CaptureResult nested = capturePojoFieldsRecursive(
+                                evaluator, fieldExpr, nestedSigs, depth + 1, nestedVarPath);
+                        if (nested != null && !nested.fields.isEmpty()) {
+                            anyValue = true;
+                            captured.add(CapturedField.ofNested(
+                                    sig.fieldName(), sig.fieldType(), runtimeSimple, nested.fields));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Fallback — couldn't recurse
+            captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
         }
         return anyValue ? CaptureResult.composite(captured) : null;
+    }
+
+    /**
+     * For a list-typed field, reads element identities and returns a
+     * {@link CapturedField#ofListReferences} for any elements that are
+     * already-known objects (back-references). Returns {@code null} if
+     * no elements are known.
+     */
+    @Nullable
+    private CapturedField captureListFieldReferences(@NotNull XDebuggerEvaluator evaluator,
+                                                      @NotNull String listExpr,
+                                                      @NotNull ReturnFieldSignature sig,
+                                                      @NotNull String sizeStr) {
+        int size;
+        try {
+            size = Integer.parseInt(sizeStr.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (size == 0) return null;
+
+        int checkCount = Math.min(size, MAX_LIST_ELEMENTS);
+        List<String> refs = new ArrayList<>();
+        for (int i = 0; i < checkCount; i++) {
+            String elemIdentity = evaluateIdentity(evaluator, listExpr + ".get(" + i + ")");
+            if (elemIdentity != null) {
+                String existingVar = objectIdentityRegistry.get(elemIdentity);
+                if (existingVar != null) {
+                    refs.add(existingVar);
+                }
+            }
+        }
+        return refs.isEmpty() ? null : CapturedField.ofListReferences(sig.fieldName(), sig.fieldType(), refs);
+    }
+
+    /**
+     * Captures a JDK value type via {@code .toString()} and formats it as a
+     * Java-source literal appropriate for the type. Returns {@code null} on failure.
+     *
+     * <p>Examples:
+     * <ul>
+     *   <li>{@code java.lang.Long} → {@code 3L}</li>
+     *   <li>{@code java.math.BigDecimal} → {@code new BigDecimal("9.99")}</li>
+     *   <li>{@code java.time.LocalDateTime} → {@code LocalDateTime.parse("2026-04-09T19:58:03")}</li>
+     *   <li>{@code java.lang.String} → {@code "orwell@abc.com"}</li>
+     * </ul>
+     */
+    @Nullable
+    private static String captureOpaqueType(@NotNull XDebuggerEvaluator evaluator,
+                                             @NotNull String expression,
+                                             @NotNull String runtimeFqn) {
+        // For boxed primitives, prefer the unboxing expression for a clean literal
+        String unboxed = switch (runtimeFqn) {
+            case "java.lang.Long"      -> evaluateWithRetry(evaluator, expression + ".longValue()");
+            case "java.lang.Integer"   -> evaluateWithRetry(evaluator, expression + ".intValue()");
+            case "java.lang.Short"     -> evaluateWithRetry(evaluator, expression + ".shortValue()");
+            case "java.lang.Byte"      -> evaluateWithRetry(evaluator, expression + ".byteValue()");
+            case "java.lang.Float"     -> evaluateWithRetry(evaluator, expression + ".floatValue()");
+            case "java.lang.Double"    -> evaluateWithRetry(evaluator, expression + ".doubleValue()");
+            case "java.lang.Boolean"   -> evaluateWithRetry(evaluator, expression + ".booleanValue()");
+            case "java.lang.Character" -> evaluateWithRetry(evaluator, expression + ".charValue()");
+            default -> null;
+        };
+        if (unboxed != null) return unboxed;
+
+        // For String, evaluate .toString() which gives us the clean string content
+        if ("java.lang.String".equals(runtimeFqn)) {
+            String s = evaluateWithRetry(evaluator, expression + ".toString()");
+            return s; // evaluateWithRetry already formats strings with quotes
+        }
+
+        // For everything else, use .toString() and wrap with the appropriate factory
+        String toStr = evaluateWithRetry(evaluator, expression + ".toString()");
+        if (toStr == null) return null;
+
+        // Strip surrounding quotes if present — we'll re-wrap
+        String raw = toStr;
+        if (raw.startsWith("\"") && raw.endsWith("\"")) {
+            raw = raw.substring(1, raw.length() - 1);
+        }
+
+        return switch (runtimeFqn) {
+            case "java.math.BigDecimal"  -> "new BigDecimal(\"" + raw + "\")";
+            case "java.math.BigInteger"  -> "new BigInteger(\"" + raw + "\")";
+            case "java.time.LocalDate"   -> "LocalDate.parse(\"" + raw + "\")";
+            case "java.time.LocalTime"   -> "LocalTime.parse(\"" + raw + "\")";
+            case "java.time.LocalDateTime" -> "LocalDateTime.parse(\"" + raw + "\")";
+            case "java.time.ZonedDateTime" -> "ZonedDateTime.parse(\"" + raw + "\")";
+            case "java.time.OffsetDateTime" -> "OffsetDateTime.parse(\"" + raw + "\")";
+            case "java.time.Instant"     -> "Instant.parse(\"" + raw + "\")";
+            case "java.time.Duration"    -> "Duration.parse(\"" + raw + "\")";
+            case "java.time.Period"      -> "Period.parse(\"" + raw + "\")";
+            case "java.util.UUID"        -> "UUID.fromString(\"" + raw + "\")";
+            default                      -> "\"" + raw + "\" /* " + simpleNameOf(runtimeFqn) + " */";
+        };
+    }
+
+    /**
+     * Evaluates {@code System.identityHashCode(expression)} to get a stable
+     * identity for cycle detection. Returns the string form of the hash code,
+     * or {@code null} on failure.
+     */
+    @Nullable
+    private static String evaluateIdentity(@NotNull XDebuggerEvaluator evaluator,
+                                            @NotNull String expression) {
+        return evaluateWithRetry(evaluator, "System.identityHashCode(" + expression + ")");
+    }
+
+    /**
+     * Registers an object's identity in the registry so nested captures can
+     * detect back-references. No-op if the identity can't be evaluated.
+     */
+    private void registerObjectIdentity(@NotNull XDebuggerEvaluator evaluator,
+                                         @NotNull String expression,
+                                         @NotNull String varPath) {
+        String identity = evaluateIdentity(evaluator, expression);
+        if (identity != null) {
+            objectIdentityRegistry.putIfAbsent(identity, varPath);
+        }
     }
 
     /**
@@ -490,6 +821,31 @@ public final class MethodStepper {
         return dollar < 0 ? afterDot : afterDot.substring(dollar + 1);
     }
 
+    /**
+     * For dependency calls in return position (e.g. {@code return repo.save(order)}),
+     * propagate whatever the stepper captured as the method's return value to
+     * the dependency call's mock return slot. This makes the generator emit
+     * {@code thenReturn(capturedValue)} instead of {@code thenReturn(null / TODO)}.
+     */
+    private void feedReturnPositionCalls() {
+        for (TracedCall call : calls) {
+            if (!call.isInReturnPosition()) continue;
+            if (call.getCapturedReturnValue() != null || call.hasCapturedReturnFields()
+                    || call.hasCapturedReturnListElements()) continue; // already captured
+
+            if (capturedMethodReturnValue != null) {
+                call.setCapturedReturnValue(capturedMethodReturnValue);
+            } else if (!capturedMethodReturnFields.isEmpty()) {
+                call.setCapturedReturnFields(capturedMethodReturnFields);
+                if (capturedMethodReturnRuntimeType != null) {
+                    call.setCapturedReturnRuntimeType(capturedMethodReturnRuntimeType);
+                }
+            } else if (!capturedMethodReturnListElements.isEmpty()) {
+                call.setCapturedReturnListElements(capturedMethodReturnListElements);
+            }
+        }
+    }
+
     /** Stores a {@link CaptureResult} on the call, mapping each shape to the right slot. */
     private static void applyCapture(@NotNull TracedCall call, @Nullable CaptureResult result) {
         if (result == null) return;
@@ -497,6 +853,9 @@ public final class MethodStepper {
             call.setCapturedReturnValue(result.literal);
         } else if (!result.fields.isEmpty()) {
             call.setCapturedReturnFields(result.fields);
+            if (result.runtimeType != null) {
+                call.setCapturedReturnRuntimeType(result.runtimeType);
+            }
         } else if (!result.listElements.isEmpty()) {
             call.setCapturedReturnListElements(result.listElements);
         }
@@ -507,16 +866,21 @@ public final class MethodStepper {
         final String literal;
         final List<CapturedField> fields;
         final List<CapturedListElement> listElements;
+        /** Runtime simple name when resolved via runtime-class dispatch (e.g. "Book"). */
+        final String runtimeType;
 
-        private CaptureResult(String literal, List<CapturedField> fields, List<CapturedListElement> listElements) {
+        private CaptureResult(String literal, List<CapturedField> fields,
+                              List<CapturedListElement> listElements, String runtimeType) {
             this.literal = literal;
             this.fields = fields;
             this.listElements = listElements;
+            this.runtimeType = runtimeType;
         }
 
-        static CaptureResult literal(String l)              { return new CaptureResult(l, Collections.emptyList(), Collections.emptyList()); }
-        static CaptureResult composite(List<CapturedField> f) { return new CaptureResult(null, f, Collections.emptyList()); }
-        static CaptureResult list(List<CapturedListElement> e) { return new CaptureResult(null, Collections.emptyList(), e); }
+        static CaptureResult literal(String l)              { return new CaptureResult(l, Collections.emptyList(), Collections.emptyList(), null); }
+        static CaptureResult composite(List<CapturedField> f) { return new CaptureResult(null, f, Collections.emptyList(), null); }
+        static CaptureResult compositeRuntime(List<CapturedField> f, String rt) { return new CaptureResult(null, f, Collections.emptyList(), rt); }
+        static CaptureResult list(List<CapturedListElement> e) { return new CaptureResult(null, Collections.emptyList(), e, null); }
     }
 
     /**

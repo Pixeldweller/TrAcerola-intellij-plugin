@@ -1,5 +1,7 @@
 package com.pixeldweller.tracerola.model;
 
+import org.jetbrains.annotations.Nullable;
+
 import java.util.Collections;
 import java.util.List;
 
@@ -67,26 +69,63 @@ public final class CapturedParameter {
 
     /**
      * A single field inside a complex traced object.
+     *
+     * <p>Three shapes:
+     * <ul>
+     *   <li><b>Literal</b> — {@code value} is non-null, rest is default.</li>
+     *   <li><b>Nested composite</b> — {@code nestedFields} is non-empty,
+     *       {@code nestedRuntimeType} names the runtime class (e.g. "Author").</li>
+     *   <li><b>Reference</b> — {@code referenceTo} names the variable of an
+     *       already-captured object (cycle detection, e.g. author.books[0] → "findByIdResult").</li>
+     *   <li><b>List-of-references</b> — {@code listElementReferences} names
+     *       variables for known objects in a list field (e.g. author.books → ["findByIdResult"]).</li>
+     * </ul>
      */
-    public record CapturedField(String fieldName, String fieldType, String value) {
+    public record CapturedField(
+            String fieldName,
+            String fieldType,
+            @Nullable String value,
+            List<CapturedField> nestedFields,
+            @Nullable String nestedRuntimeType,
+            @Nullable String referenceTo,
+            List<String> listElementReferences) {
 
-        /**
-         * The setter method name for this field (e.g. "title" -> "setTitle").
-         */
+        /** Backwards-compatible 3-arg constructor for literal fields. */
+        public CapturedField(String fieldName, String fieldType, @Nullable String value) {
+            this(fieldName, fieldType, value, Collections.emptyList(), null, null, Collections.emptyList());
+        }
+
+        public static CapturedField ofNested(String fieldName, String fieldType,
+                                              String runtimeType, List<CapturedField> fields) {
+            return new CapturedField(fieldName, fieldType, null, fields, runtimeType, null, Collections.emptyList());
+        }
+
+        public static CapturedField ofReference(String fieldName, String fieldType, String varName) {
+            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, varName, Collections.emptyList());
+        }
+
+        public static CapturedField ofListReferences(String fieldName, String fieldType, List<String> refs) {
+            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, null, refs);
+        }
+
+        public boolean isNested() { return !nestedFields.isEmpty(); }
+        public boolean isReference() { return referenceTo != null; }
+        public boolean hasListReferences() { return !listElementReferences.isEmpty(); }
+
         public String setterName() {
             return "set" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         }
 
-        /**
-         * The getter method name for this field. Booleans use the {@code is}
-         * prefix; everything else uses {@code get}. Used by the test generator
-         * when emitting {@code assertEquals(value, result.getX())} lines.
-         */
         public String getterName() {
             String suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
             boolean isBool = "boolean".equals(fieldType) || "Boolean".equals(fieldType)
                     || "java.lang.Boolean".equals(fieldType);
             return (isBool ? "is" : "get") + suffix;
+        }
+
+        /** Getter name for list fields — used by generator to emit .getBooks().add(...). */
+        public String listGetterName() {
+            return getterName();
         }
     }
 }

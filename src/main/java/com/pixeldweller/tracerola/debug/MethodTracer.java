@@ -109,16 +109,29 @@ public final class MethodTracer {
                 String resultVar = findResultVariable(expr);
                 tc.setResultVariable(resultVar);
 
+                // Check if this call is in a return statement:
+                //   return orderRepository.save(order);
+                tc.setInReturnPosition(isInReturnPosition(expr));
+
                 // Backtrace — only if we couldn't find a direct result variable.
-                // Recovers values from patterns like target.setX(thisCall()) by
-                // recording target.getX() / target.isX() for the stepper to read.
-                if (resultVar == null) {
-                    tc.setBacktraceExpressions(findBacktraceExpressions(expr));
+                if (resultVar == null && !tc.isInReturnPosition()) {
+                    List<String> backtrace = findBacktraceExpressions(expr);
+                    // Fallback: for calls whose return is discarded (e.g. repo.save(book)),
+                    // use the first argument as a proxy. Works well for save/persist/merge
+                    // patterns where the return is the same entity.
+                    if (backtrace.isEmpty()) {
+                        backtrace = findFirstArgAsBacktrace(expr);
+                    }
+                    tc.setBacktraceExpressions(backtrace);
                 }
 
-                if (seen.add(tc.callKey())) {
+                String key = tc.callKey() + "@" + tc.toExpression();
+                //if (seen.add(key)) {
                     calls.add(tc);
-                }
+                //}
+//                if (seen.add(tc.callKey())) {
+//                    calls.add(tc);
+//                }
             }
         });
 
@@ -159,9 +172,29 @@ public final class MethodTracer {
      */
     @Nullable
     private static String findResultVariable(@NotNull PsiMethodCallExpression expr) {
-        PsiElement parent = expr.getParent();
+        PsiElement context = expr;
 
-        // Case: Type result = service.call();
+        // Walk up past method chains: a.findById(id).orElseThrow(...)
+        // Each link in the chain has the structure:
+        //   PsiMethodCallExpression  ← us
+        //     → parent: PsiReferenceExpression (we're the qualifier of the next call)
+        //       → parent: PsiMethodCallExpression (the chained call)
+        // Keep climbing until the chain ends.
+        while (true) {
+            PsiElement p = context.getParent();
+            if (p instanceof PsiReferenceExpression) {
+                PsiElement pp = p.getParent();
+                if (pp instanceof PsiMethodCallExpression) {
+                    context = pp;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        PsiElement parent = context.getParent();
+
+        // Case: Type result = service.call();  (or end of chain)
         if (parent instanceof PsiLocalVariable localVar) {
             return localVar.getName();
         }
@@ -175,7 +208,6 @@ public final class MethodTracer {
         }
 
         // Case: Type result = someCondition ? service.call() : other;
-        // (parent is PsiConditionalExpression → grandparent might be a variable)
         if (parent instanceof PsiConditionalExpression) {
             PsiElement grandparent = parent.getParent();
             if (grandparent instanceof PsiLocalVariable localVar) {
@@ -268,14 +300,22 @@ public final class MethodTracer {
         }
 
         Map<Integer, String> returnPoints = findReturnPoints(method);
+        Map<Integer, String> throwPoints = findThrowPoints(method);
         return new ReturnAnalysis(returnTypeText, isEnum, sigs, returnPoints,
-                isList, elementType, elementIsEnum, elementSigs);
+                isList, elementType, elementIsEnum, elementSigs, throwPoints);
     }
 
     /**
-     * Walks the method body for {@code return} statements whose expression is a
-     * bare {@link PsiReferenceExpression}. Returns a map keyed by 0-based line
-     * number so the stepper can match against the current paused line.
+     * Walks the method body for {@code return} statements and records
+     * safe-to-evaluate expressions keyed by 0-based line number.
+     *
+     * <p>Handles two forms:
+     * <ul>
+     *   <li>{@code return result;} — bare reference, evaluate directly.</li>
+     *   <li>{@code return dep.call(arg);} — method call; we can't re-execute it,
+     *       but if the first argument is a reference, use it as a proxy. Works
+     *       well for save/persist patterns where the return ≈ the input.</li>
+     * </ul>
      */
     @NotNull
     private static Map<Integer, String> findReturnPoints(@NotNull PsiMethod method) {
@@ -294,9 +334,79 @@ public final class MethodTracer {
             public void visitReturnStatement(@NotNull PsiReturnStatement statement) {
                 super.visitReturnStatement(statement);
                 PsiExpression returnExpr = statement.getReturnValue();
-                if (!(returnExpr instanceof PsiReferenceExpression)) return; // skip side-effect-prone forms
+                if (returnExpr == null) return;
+
                 int line = document.getLineNumber(statement.getTextOffset());
-                points.put(line, returnExpr.getText());
+
+                // Direct: return result;
+                if (returnExpr instanceof PsiReferenceExpression) {
+                    points.put(line, returnExpr.getText());
+                    return;
+                }
+
+                // return dep.call(arg) — use first arg as proxy
+                if (returnExpr instanceof PsiMethodCallExpression methodCall) {
+                    PsiExpression[] args = methodCall.getArgumentList().getExpressions();
+                    if (args.length > 0 && args[0] instanceof PsiReferenceExpression) {
+                        points.put(line, args[0].getText());
+                    }
+                }
+            }
+        });
+        return points;
+    }
+
+    /**
+     * Walks the method body for {@code throw} statements and records the
+     * exception type keyed by 0-based line number. Handles both single-line
+     * and multi-line throw statements — the line of the {@code throw} keyword
+     * is used as the key.
+     *
+     * <p>Supports:
+     * <ul>
+     *   <li>{@code throw new IllegalStateException("msg");}</li>
+     *   <li>{@code throw new IllegalArgumentException("Book not found: " + bookId);}</li>
+     *   <li>Multi-line throws where the constructor args span several lines.</li>
+     * </ul>
+     */
+    @NotNull
+    private static Map<Integer, String> findThrowPoints(@NotNull PsiMethod method) {
+        PsiCodeBlock body = method.getBody();
+        if (body == null) return Collections.emptyMap();
+
+        PsiFile file = method.getContainingFile();
+        Document document = file != null
+                ? PsiDocumentManager.getInstance(file.getProject()).getDocument(file)
+                : null;
+        if (document == null) return Collections.emptyMap();
+
+        Map<Integer, String> points = new LinkedHashMap<>();
+        body.accept(new JavaRecursiveElementWalkingVisitor() {
+            @Override
+            public void visitThrowStatement(@NotNull PsiThrowStatement statement) {
+                super.visitThrowStatement(statement);
+                PsiExpression exception = statement.getException();
+                if (exception == null) return;
+
+                String exceptionType = null;
+                // throw new SomeException(...)
+                if (exception instanceof PsiNewExpression newExpr) {
+                    PsiJavaCodeReferenceElement classRef = newExpr.getClassReference();
+                    if (classRef != null) {
+                        exceptionType = classRef.getReferenceName();
+                    }
+                }
+                // throw someVariable — resolve its type
+                if (exceptionType == null) {
+                    PsiType type = exception.getType();
+                    if (type != null) {
+                        exceptionType = type.getPresentableText();
+                    }
+                }
+                if (exceptionType == null) return;
+
+                int line = document.getLineNumber(statement.getTextOffset());
+                points.put(line, exceptionType);
             }
         });
         return points;
@@ -395,6 +505,53 @@ public final class MethodTracer {
 
     /** Internal carrier for the result of {@link #analyzeListShape}. */
     private record ListShape(String elementType, boolean elementIsEnum, List<ReturnFieldSignature> elementSignatures) {}
+
+    /**
+     * For calls whose return value is discarded (no variable, no backtrace,
+     * not in return position), returns the first argument as a backtrace
+     * expression when it's a simple local variable reference.
+     *
+     * <p>Captures the argument AFTER the call executes, so it reflects any
+     * mutations the method made. Works well for save/persist/merge patterns
+     * where the return is the same (or similar) entity as the input.
+     * Returns empty when the call has no args or the arg isn't a simple reference.
+     */
+    @NotNull
+    private static List<String> findFirstArgAsBacktrace(@NotNull PsiMethodCallExpression call) {
+        PsiExpression[] args = call.getArgumentList().getExpressions();
+        if (args.length == 0) return Collections.emptyList();
+        PsiExpression firstArg = args[0];
+        if (firstArg instanceof PsiReferenceExpression) {
+            return List.of(firstArg.getText());
+        }
+        return Collections.emptyList();
+    }
+
+    /**
+     * Checks whether the call expression is a direct child of a {@code return}
+     * statement (possibly through a chain).
+     * <ul>
+     *   <li>{@code return repo.save(order);} → true</li>
+     *   <li>{@code return repo.findById(id).orElseThrow(...);} → true (for findById)</li>
+     *   <li>{@code Book b = repo.findById(id).orElseThrow(...);} → false</li>
+     * </ul>
+     */
+    private static boolean isInReturnPosition(@NotNull PsiMethodCallExpression expr) {
+        PsiElement context = expr;
+        // Walk up past method chains
+        while (true) {
+            PsiElement p = context.getParent();
+            if (p instanceof PsiReferenceExpression) {
+                PsiElement pp = p.getParent();
+                if (pp instanceof PsiMethodCallExpression) {
+                    context = pp;
+                    continue;
+                }
+            }
+            break;
+        }
+        return context.getParent() instanceof PsiReturnStatement;
+    }
 
     private static boolean isInjected(PsiField field) {
         for (PsiAnnotation ann : field.getAnnotations()) {

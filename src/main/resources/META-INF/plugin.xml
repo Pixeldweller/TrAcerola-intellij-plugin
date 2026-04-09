@@ -39,6 +39,10 @@
                     icon="/icons/toolWindowAcerola.svg"/>
 
         <notificationGroup id="TrAcerola Notifications" displayType="BALLOON"/>
+
+        <statusBarWidgetFactory id="TrAcerola.TracingIndicator"
+                                implementation="com.pixeldweller.tracerola.ui.TracingStatusBarWidgetFactory"
+                                order="after position"/>
     </extensions>
 
     <projectListeners>

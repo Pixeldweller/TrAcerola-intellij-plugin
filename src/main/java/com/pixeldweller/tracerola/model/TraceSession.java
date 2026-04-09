@@ -37,6 +37,9 @@ public final class TraceSession {
     /** Element-wise capture for {@code List<E>} returns. Empty when not applicable. */
     private final List<CapturedListElement> capturedReturnListElements;
 
+    /** Exception type if the method exited via {@code throw} (e.g. "IllegalStateException"), or {@code null}. */
+    private final String thrownExceptionType;
+
     public TraceSession(String packageName,
                         String className,
                         String methodName,
@@ -44,7 +47,7 @@ public final class TraceSession {
                         List<CapturedParameter> parameters,
                         List<TracedCall> tracedCalls) {
         this(packageName, className, methodName, returnType, null, parameters, tracedCalls,
-                null, Collections.emptyList(), Collections.emptyList());
+                null, Collections.emptyList(), Collections.emptyList(), null);
     }
 
     public TraceSession(String packageName,
@@ -56,7 +59,8 @@ public final class TraceSession {
                         List<TracedCall> tracedCalls,
                         @Nullable String capturedReturnValue,
                         List<CapturedField> capturedReturnFields,
-                        List<CapturedListElement> capturedReturnListElements) {
+                        List<CapturedListElement> capturedReturnListElements,
+                        @Nullable String thrownExceptionType) {
         this.packageName = packageName;
         this.className = className;
         this.methodName = methodName;
@@ -72,6 +76,7 @@ public final class TraceSession {
         this.capturedReturnListElements = capturedReturnListElements != null
                 ? List.copyOf(capturedReturnListElements)
                 : Collections.emptyList();
+        this.thrownExceptionType = thrownExceptionType;
     }
 
     public String getPackageName()               { return packageName; }
@@ -90,6 +95,9 @@ public final class TraceSession {
     public List<CapturedField> getCapturedReturnFields() { return capturedReturnFields; }
 
     public List<CapturedListElement> getCapturedReturnListElements() { return capturedReturnListElements; }
+
+    @Nullable
+    public String getThrownExceptionType()  { return thrownExceptionType; }
 
     /** True when at least one return-field value was captured at the executed {@code return}. */
     public boolean hasCapturedReturnFields() {

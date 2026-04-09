@@ -25,6 +25,7 @@ import java.util.Map;
  * @param elementType           presentable text of the list element type, or {@code null}
  * @param elementIsEnum         true when the list element type is a Java enum
  * @param elementFieldSignatures non-static instance fields of the list element type for POJO decomposition
+ * @param throwPoints           0-based source line → exception type (presentable text) for {@code throw} statements
  */
 public record ReturnAnalysis(
         String returnType,
@@ -34,11 +35,12 @@ public record ReturnAnalysis(
         boolean isList,
         String elementType,
         boolean elementIsEnum,
-        List<ReturnFieldSignature> elementFieldSignatures) {
+        List<ReturnFieldSignature> elementFieldSignatures,
+        Map<Integer, String> throwPoints) {
 
     public static final ReturnAnalysis VOID =
             new ReturnAnalysis("void", false, Collections.emptyList(), Collections.emptyMap(),
-                    false, null, false, Collections.emptyList());
+                    false, null, false, Collections.emptyList(), Collections.emptyMap());
 
     /** Convenience for the common non-list case. */
     public ReturnAnalysis(String returnType,
@@ -46,7 +48,7 @@ public record ReturnAnalysis(
                           List<ReturnFieldSignature> fieldSignatures,
                           Map<Integer, String> returnPoints) {
         this(returnType, isEnum, fieldSignatures, returnPoints,
-                false, null, false, Collections.emptyList());
+                false, null, false, Collections.emptyList(), Collections.emptyMap());
     }
 
     public boolean isVoid() {
