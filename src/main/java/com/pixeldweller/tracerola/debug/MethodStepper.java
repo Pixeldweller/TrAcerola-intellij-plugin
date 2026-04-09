@@ -402,7 +402,20 @@ public final class MethodStepper {
 
         // Try declared-type field signatures first.
         CaptureResult pojoResult = capturePojoFields(evaluator, expression, spec.fieldSignatures());
-        if (pojoResult != null) return pojoResult;
+        if (pojoResult != null) {
+            // If the runtime type differs from the declared type (e.g. declared
+            // as generic "S" but runtime is "BookOrder"), attach the runtime name
+            // so the generator can emit the correct type in the test.
+            if (runtimeFqn != null) {
+                String runtimeSimple = simpleNameOf(runtimeFqn);
+                String declaredSimple = spec.declaredType() != null
+                        ? simpleNameOf(spec.declaredType()) : null;
+                if (!runtimeSimple.equals(declaredSimple)) {
+                    return CaptureResult.compositeRuntime(pojoResult.fields, runtimeSimple);
+                }
+            }
+            return pojoResult;
+        }
 
         // Fallback: runtime-class dispatch. The declared type may be wrong
         // (e.g. Optional when the variable holds Book after .orElseThrow()),
@@ -524,7 +537,7 @@ public final class MethodStepper {
     private CaptureResult capturePojoFields(@NotNull XDebuggerEvaluator evaluator,
                                             @NotNull String expression,
                                             @NotNull List<ReturnFieldSignature> sigs) {
-        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, null);
+        return capturePojoFieldsRecursive(evaluator, expression, sigs, 0, expression);
     }
 
     /**

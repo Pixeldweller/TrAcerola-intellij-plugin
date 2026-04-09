@@ -75,24 +75,43 @@ public final class TestCaseGenerator {
         if (!mockable.isEmpty()) {
             sb.append("    // Mock setup\n");
             Set<String> usedReturnVars = new HashSet<>();
+
+            // First pass: assign generated variable names and build source → generated mapping.
+            // This lets us rewrite references like "book" → "findByIdResult" everywhere.
+            Map<String, String> varMapping = new LinkedHashMap<>();
+            Map<TracedCall, String> callVarNames = new LinkedHashMap<>();
+            for (TracedCall c : mockable) {
+                if (c.hasCapturedReturnFields() || c.hasCapturedReturnListElements()) {
+                    String varName = makeUniqueReturnVarName(c, usedReturnVars);
+                    callVarNames.put(c, varName);
+                    // Map the source-code result variable to the generated name
+                    if (c.getResultVariable() != null) {
+                        varMapping.putIfAbsent(c.getResultVariable(), varName);
+                    }
+                    // Also map backtrace expressions
+                    for (String bt : c.getBacktraceExpressions()) {
+                        varMapping.putIfAbsent(bt, varName);
+                    }
+                }
+            }
+
+            // Second pass: emit code with rewritten references
             for (TracedCall c : mockable) {
                 String returnValue;
                 String traceComment = null;
 
                 if (c.hasCapturedReturnListElements()) {
-                    // List<E> return — build an ArrayList, populate, use it in thenReturn.
-                    String varName = makeUniqueReturnVarName(c, usedReturnVars);
+                    String varName = callVarNames.get(c);
                     appendListConstruction(sb, "    ", varName,
                             c.getReturnType(), c.getReturnElementType(),
                             c.getCapturedReturnListElements(), usedReturnVars);
                     returnValue = varName;
                 } else if (c.hasCapturedReturnFields()) {
-                    // Composite POJO return — emit `new Type(); var.setX(...)` block.
                     String emitType = c.getCapturedReturnRuntimeType() != null
                             ? c.getCapturedReturnRuntimeType() : c.getReturnType();
-                    String varName = makeUniqueReturnVarName(c, usedReturnVars);
+                    String varName = callVarNames.get(c);
                     appendCompositeConstruction(sb, "    ", varName, emitType,
-                            c.getCapturedReturnFields(), usedReturnVars);
+                            c.getCapturedReturnFields(), usedReturnVars, varMapping);
                     returnValue = varName;
                 } else if (c.getCapturedReturnValue() != null) {
                     returnValue = c.getCapturedReturnValue();
@@ -106,9 +125,14 @@ public final class TestCaseGenerator {
                 boolean needsWrapHint = c.getCapturedReturnRuntimeType() != null
                         && !c.getReturnType().equals(c.getCapturedReturnRuntimeType())
                         && c.hasCapturedReturnFields();
+
+                // Rewrite mock argument expressions using the variable mapping
+                List<String> rewrittenArgs = c.getArgExpressions().stream()
+                        .map(arg -> varMapping.getOrDefault(arg, arg))
+                        .toList();
                 sb.append("    when(").append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
-                  .append(String.join(", ", c.getArgExpressions()))
+                  .append(String.join(", ", rewrittenArgs))
                   .append(")).thenReturn(").append(returnValue).append(");");
                 if (needsWrapHint) {
                     sb.append(" // TODO: may need wrapping, e.g. Optional.of(").append(returnValue).append(")");
@@ -298,52 +322,56 @@ public final class TestCaseGenerator {
      * findByIdResult.setAuthor(findByIdResultAuthor);
      * </pre>
      */
+    /** Overload without varMapping — used by parameter emission. */
     private static void appendCompositeConstruction(@NotNull StringBuilder sb,
                                                      @NotNull String indent,
                                                      @NotNull String varName,
                                                      @NotNull String typeName,
                                                      @NotNull List<CapturedField> fields,
                                                      @NotNull Set<String> usedNames) {
+        appendCompositeConstruction(sb, indent, varName, typeName, fields, usedNames, Collections.emptyMap());
+    }
+
+    private static void appendCompositeConstruction(@NotNull StringBuilder sb,
+                                                     @NotNull String indent,
+                                                     @NotNull String varName,
+                                                     @NotNull String typeName,
+                                                     @NotNull List<CapturedField> fields,
+                                                     @NotNull Set<String> usedNames,
+                                                     @NotNull Map<String, String> varMapping) {
         sb.append(indent).append(typeName).append(' ').append(varName)
           .append(" = new ").append(typeName).append("(); // traced\n");
 
-        // First pass: emit nested objects (they must be declared before being used in setters)
+        // First pass: emit nested objects (declared before being used in setters)
         // Also collect deferred setter calls for nested/reference fields
         List<String> deferredSetters = new ArrayList<>();
 
         for (CapturedField f : fields) {
-            if(f.getterName().contains("Email")){
-                System.out.println("test");
-            }
-            if(f.getterName().contains("Name")){
-                System.out.println("test");
-            }
             if (f.isNested()) {
-                // Nested composite — declare the nested variable first
                 String nestedVar = varName + capitalize(f.fieldName());
                 int dedup = 2;
                 while (!usedNames.add(nestedVar)) {
                     nestedVar = varName + capitalize(f.fieldName()) + (dedup++);
                 }
                 appendCompositeConstruction(sb, indent, nestedVar,
-                        f.nestedRuntimeType(), f.nestedFields(), usedNames);
+                        f.nestedRuntimeType(), f.nestedFields(), usedNames, varMapping);
                 deferredSetters.add(indent + varName + "." + f.setterName() + "(" + nestedVar + ");\n");
             } else if (f.isReference()) {
-                // Back-reference to an already-declared variable
-                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + f.referenceTo() + ");\n");
+                // Rewrite source-code var name → generated var name
+                String ref = varMapping.getOrDefault(f.referenceTo(), f.referenceTo());
+                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + ref + ");\n");
             } else if (f.hasListReferences()) {
-                // List field containing known objects — emit .getX().add(ref) for each
-                for (String ref : f.listElementReferences()) {
+                for (String rawRef : f.listElementReferences()) {
+                    String ref = varMapping.getOrDefault(rawRef, rawRef);
                     deferredSetters.add(indent + varName + "." + f.listGetterName() + "().add(" + ref + ");\n");
                 }
             } else if (f.value() != null) {
-                // Simple literal field
                 sb.append(indent).append(varName).append('.')
                   .append(f.setterName()).append('(').append(f.value()).append(");\n");
             }
         }
 
-        // Second pass: emit deferred setters (nested object setters + references)
+        // Second pass: emit deferred setters
         for (String setter : deferredSetters) {
             sb.append(setter);
         }
