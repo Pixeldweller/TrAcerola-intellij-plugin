@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.pixeldweller"
-version = "0.1-alpha"
+version = "0.2-alpha"
 
 repositories {
     mavenCentral()
