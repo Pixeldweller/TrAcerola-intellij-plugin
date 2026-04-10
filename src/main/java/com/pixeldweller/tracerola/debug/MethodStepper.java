@@ -903,8 +903,17 @@ public final class MethodStepper {
                 call.setCapturedReturnValue(capturedMethodReturnValue);
             } else if (!capturedMethodReturnFields.isEmpty()) {
                 call.setCapturedReturnFields(capturedMethodReturnFields);
-                if (capturedMethodReturnRuntimeType != null) {
-                    call.setCapturedReturnRuntimeType(capturedMethodReturnRuntimeType);
+                // Propagate the actual type so the generator emits e.g. "BookOrder"
+                // instead of a generic "S". Prefer the runtime type from capture;
+                // fall back to the method's declared return type when the call's own
+                // return type differs (common for generic repo methods like save(S)).
+                String effectiveType = capturedMethodReturnRuntimeType;
+                if (effectiveType == null && returnAnalysis.returnType() != null
+                        && !returnAnalysis.returnType().equals(call.getReturnType())) {
+                    effectiveType = returnAnalysis.returnType();
+                }
+                if (effectiveType != null) {
+                    call.setCapturedReturnRuntimeType(effectiveType);
                 }
             } else if (!capturedMethodReturnListElements.isEmpty()) {
                 call.setCapturedReturnListElements(capturedMethodReturnListElements);

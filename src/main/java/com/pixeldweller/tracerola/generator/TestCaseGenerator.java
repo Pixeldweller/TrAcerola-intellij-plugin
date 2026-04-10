@@ -95,6 +95,28 @@ public final class TestCaseGenerator {
                 }
             }
 
+            // Collect all referenced identity paths from captured fields, then
+            // derive mappings for nested paths (e.g. "bookAuthor" → "findByIdResultAuthor")
+            // by matching source-variable prefixes.
+            Set<String> allRefs = new LinkedHashSet<>();
+            for (TracedCall c : mockable) {
+                collectReferences(c.getCapturedReturnFields(), allRefs);
+            }
+            for (String ref : allRefs) {
+                if (varMapping.containsKey(ref)) continue;
+                // Try to match a prefix: "bookAuthor" starts with "book" + uppercase
+                for (Map.Entry<String, String> e : varMapping.entrySet()) {
+                    String srcPrefix = e.getKey();
+                    if (ref.length() > srcPrefix.length()
+                            && ref.startsWith(srcPrefix)
+                            && Character.isUpperCase(ref.charAt(srcPrefix.length()))) {
+                        String suffix = ref.substring(srcPrefix.length());
+                        varMapping.put(ref, e.getValue() + suffix);
+                        break;
+                    }
+                }
+            }
+
             // Second pass: emit code with rewritten references
             for (TracedCall c : mockable) {
                 String returnValue;
@@ -466,6 +488,20 @@ public final class TestCaseGenerator {
             } else if (elem.isUnknown()) {
                 sb.append(indent).append("// TODO assert ").append(accessor)
                   .append(": runtime type was ").append(elem.runtimeType()).append('\n');
+            }
+        }
+    }
+
+    /** Recursively collects all reference and list-reference identity paths from fields. */
+    private static void collectReferences(@Nullable List<CapturedField> fields, @NotNull Set<String> out) {
+        if (fields == null) return;
+        for (CapturedField f : fields) {
+            if (f.isReference()) {
+                out.add(f.referenceTo());
+            } else if (f.hasListReferences()) {
+                out.addAll(f.listElementReferences());
+            } else if (f.isNested()) {
+                collectReferences(f.nestedFields(), out);
             }
         }
     }
