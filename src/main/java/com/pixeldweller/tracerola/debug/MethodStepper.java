@@ -11,6 +11,7 @@ import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XSourcePosition;
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator;
 import com.intellij.xdebugger.frame.XStackFrame;
+import com.intellij.xdebugger.frame.XValue;
 import com.pixeldweller.tracerola.model.CapturedListElement;
 import com.pixeldweller.tracerola.model.CapturedParameter.CapturedField;
 import com.pixeldweller.tracerola.model.ReturnAnalysis;
@@ -50,7 +51,7 @@ public final class MethodStepper {
     private static final long SETTLE_MS = 1000;
 
     /** Extra wait when an evaluation comes back as IntelliJ's "Collecting data…" placeholder. */
-    private static final long COLLECTING_RETRY_MS = 1500;
+    private static final long COLLECTING_RETRY_MS = 2500;
 
     /** Hard cap on list-element captures so a {@code findAll()} of 100k rows doesn't hang the stepper. */
     private static final int MAX_LIST_ELEMENTS = 50;
@@ -95,6 +96,7 @@ public final class MethodStepper {
      * "lookup attempted but no usable PsiClass found" — sentinel to avoid retries.
      */
     private final Map<String, List<ReturnFieldSignature>> runtimeFieldSignatureCache = new HashMap<>();
+    private final Map<String, List<TracedCall.ConstructorParam>> runtimeConstructorCache = new HashMap<>();
 
     /** Max nesting depth for recursive POJO capture (Book → Author → stop). */
     private static final int MAX_NESTING_DEPTH = 2;
@@ -119,6 +121,21 @@ public final class MethodStepper {
             "java.util.UUID", "java.util.Date", "java.sql.Timestamp",
             "java.net.URL", "java.net.URI"
     );
+
+    /**
+     * Fallback mapping from short type names (as returned by PSI's
+     * {@code getPresentableText()}) to FQN, used when {@code evaluateRuntimeFqn}
+     * fails but the declared field type is a known opaque type.
+     */
+    private static final Map<String, String> OPAQUE_SHORT_TO_FQN;
+    static {
+        Map<String, String> m = new HashMap<>();
+        for (String fqn : OPAQUE_TYPES) {
+            String shortName = fqn.substring(fqn.lastIndexOf('.') + 1);
+            m.put(shortName, fqn);
+        }
+        OPAQUE_SHORT_TO_FQN = Map.copyOf(m);
+    }
 
     /**
      * Identity registry: maps {@code System.identityHashCode(obj)} to the variable
@@ -412,8 +429,14 @@ public final class MethodStepper {
                 String declaredSimple = spec.declaredType() != null
                         ? simpleNameOf(spec.declaredType()) : null;
                 if (!runtimeSimple.equals(declaredSimple)) {
-                    return CaptureResult.compositeRuntime(pojoResult.fields, runtimeSimple);
+                    return CaptureResult.compositeRuntime(pojoResult.fields, runtimeSimple,
+                            resolveConstructorParams(runtimeFqn));
                 }
+            }
+            // Declared type matches — still resolve constructor for the declared type
+            if (runtimeFqn != null) {
+                return CaptureResult.compositeRuntime(pojoResult.fields, null,
+                        resolveConstructorParams(runtimeFqn));
             }
             return pojoResult;
         }
@@ -426,7 +449,8 @@ public final class MethodStepper {
             if (!runtimeSigs.isEmpty()) {
                 CaptureResult runtimeResult = capturePojoFields(evaluator, expression, runtimeSigs);
                 if (runtimeResult != null && !runtimeResult.fields.isEmpty()) {
-                    return CaptureResult.compositeRuntime(runtimeResult.fields, simpleNameOf(runtimeFqn));
+                    return CaptureResult.compositeRuntime(runtimeResult.fields, simpleNameOf(runtimeFqn),
+                            resolveConstructorParams(runtimeFqn));
                 }
             }
         }
@@ -511,7 +535,8 @@ public final class MethodStepper {
                 boolean proxy = rawElemFqn != null && isProxyFqn(rawElemFqn);
                 CaptureResult res = capturePojoFields(evaluator, elementExpr, runtimeSigs, proxy);
                 if (res != null && !res.fields.isEmpty()) {
-                    return CapturedListElement.ofRuntimeFields(runtimeSimple, res.fields);
+                    return CapturedListElement.ofRuntimeFields(runtimeSimple, res.fields,
+                            resolveConstructorParams(runtimeFqn));
                 }
             }
         }
@@ -595,7 +620,7 @@ public final class MethodStepper {
             if (val != null) {
                 // Literal field — primitives, String, enum, etc.
                 anyValue = true;
-                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val));
+                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), val, sig.hasSetter()));
                 continue;
             }
 
@@ -605,20 +630,35 @@ public final class MethodStepper {
             // If so, try .toString() and format as a type-aware literal.
             String rawFieldFqn = evaluateRuntimeFqn(evaluator, fieldExpr);
             String runtimeFqn = rawFieldFqn != null ? deproxyFqn(rawFieldFqn) : null;
+
+            // Fallback: if evaluateRuntimeFqn failed, check whether the declared
+            // field type is a known opaque type (e.g. "LocalDateTime" → "java.time.LocalDateTime").
+            if (runtimeFqn == null) {
+                runtimeFqn = OPAQUE_SHORT_TO_FQN.get(sig.fieldType());
+            }
+
             if (runtimeFqn != null && OPAQUE_TYPES.contains(runtimeFqn)) {
                 String opaqueVal = captureOpaqueType(evaluator, fieldExpr, runtimeFqn);
+               
+                // If direct field access failed (e.g. chaining .toString() on a private
+                // field doesn't work in the evaluator), retry via the getter — the
+                // debugger handles getter calls reliably even when field chaining fails.
+                if (opaqueVal == null && !useGetters) {
+                    String getterExpr = expression + "." + sig.getterName() + "()";
+                    opaqueVal = captureOpaqueType(evaluator, getterExpr, runtimeFqn);
+                }
                 if (opaqueVal != null) {
                     anyValue = true;
-                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), opaqueVal));
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), opaqueVal, sig.hasSetter()));
                 } else {
-                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null, sig.hasSetter()));
                 }
                 continue;
             }
 
             // Try identity-based recursion if we haven't hit the depth limit.
             if (depth >= MAX_NESTING_DEPTH) {
-                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null, sig.hasSetter()));
                 continue;
             }
 
@@ -631,7 +671,7 @@ public final class MethodStepper {
                     anyValue = true;
                     captured.add(listField);
                 } else {
-                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+                    captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null, sig.hasSetter()));
                 }
                 continue;
             }
@@ -664,8 +704,9 @@ public final class MethodStepper {
                                 evaluator, fieldExpr, nestedSigs, depth + 1, nestedVarPath, fieldIsProxy);
                         if (nested != null && !nested.fields.isEmpty()) {
                             anyValue = true;
+                            List<TracedCall.ConstructorParam> ctorParams = resolveConstructorParams(runtimeFqn);
                             captured.add(CapturedField.ofNested(
-                                    sig.fieldName(), sig.fieldType(), runtimeSimple, nested.fields));
+                                    sig.fieldName(), sig.fieldType(), runtimeSimple, nested.fields, ctorParams));
                             continue;
                         }
                     }
@@ -673,7 +714,7 @@ public final class MethodStepper {
             }
 
             // Fallback — couldn't recurse
-            captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null));
+            captured.add(new CapturedField(sig.fieldName(), sig.fieldType(), null, sig.hasSetter()));
         }
         return anyValue ? CaptureResult.composite(captured) : null;
     }
@@ -749,6 +790,20 @@ public final class MethodStepper {
 
         // For everything else, use .toString() and wrap with the appropriate factory
         String toStr = evaluateWithRetry(evaluator, expression + ".toString()");
+        if (toStr == null) {
+            // .toString() chaining can fail when the JDI evaluator can't invoke the
+            // method on the suspended thread (common with java.time types).  Fall back
+            // to reading the debugger's own value presentation — it computes toString
+            // internally through a different pipeline that usually succeeds.
+            // readRawPresentation waits for the real value (skips "Collecting data…").
+            XValue xValue = ParameterEvaluator.evaluateRaw(evaluator, expression);
+            if (xValue != null) {
+                String rawPres = ParameterEvaluator.readRawPresentation(xValue);
+                if (rawPres != null && !rawPres.isEmpty()) {
+                    toStr = rawPres.startsWith("\"") ? rawPres : "\"" + rawPres + "\"";
+                }
+            }
+        }
         if (toStr == null) return null;
 
         // Strip surrounding quotes if present — we'll re-wrap
@@ -814,11 +869,19 @@ public final class MethodStepper {
                     (Computable<List<ReturnFieldSignature>>) () -> {
                         PsiClass cls = JavaPsiFacade.getInstance(project)
                                 .findClass(qn, GlobalSearchScope.allScope(project));
-                        return cls != null
-                                ? MethodTracer.collectInstanceFieldSignatures(cls)
-                                : Collections.emptyList();
+                        if (cls == null) return Collections.emptyList();
+                        // Also resolve and cache constructor info in the same read action
+                        runtimeConstructorCache.putIfAbsent(qn,
+                                MethodTracer.collectBestConstructor(cls));
+                        return MethodTracer.collectInstanceFieldSignatures(cls);
                     });
         });
+    }
+
+    /** Returns cached constructor params for a previously resolved FQN. */
+    @NotNull
+    private List<TracedCall.ConstructorParam> resolveConstructorParams(@NotNull String fqn) {
+        return runtimeConstructorCache.getOrDefault(fqn, Collections.emptyList());
     }
 
     /**
@@ -931,6 +994,9 @@ public final class MethodStepper {
             if (result.runtimeType != null) {
                 call.setCapturedReturnRuntimeType(result.runtimeType);
             }
+            if (!result.constructorParams.isEmpty()) {
+                call.setReturnConstructorParams(result.constructorParams);
+            }
         } else if (!result.listElements.isEmpty()) {
             call.setCapturedReturnListElements(result.listElements);
         }
@@ -943,19 +1009,24 @@ public final class MethodStepper {
         final List<CapturedListElement> listElements;
         /** Runtime simple name when resolved via runtime-class dispatch (e.g. "Book"). */
         final String runtimeType;
+        /** Constructor params for the captured type (empty = use no-arg constructor). */
+        final List<TracedCall.ConstructorParam> constructorParams;
 
         private CaptureResult(String literal, List<CapturedField> fields,
-                              List<CapturedListElement> listElements, String runtimeType) {
+                              List<CapturedListElement> listElements, String runtimeType,
+                              List<TracedCall.ConstructorParam> constructorParams) {
             this.literal = literal;
             this.fields = fields;
             this.listElements = listElements;
             this.runtimeType = runtimeType;
+            this.constructorParams = constructorParams;
         }
 
-        static CaptureResult literal(String l)              { return new CaptureResult(l, Collections.emptyList(), Collections.emptyList(), null); }
-        static CaptureResult composite(List<CapturedField> f) { return new CaptureResult(null, f, Collections.emptyList(), null); }
-        static CaptureResult compositeRuntime(List<CapturedField> f, String rt) { return new CaptureResult(null, f, Collections.emptyList(), rt); }
-        static CaptureResult list(List<CapturedListElement> e) { return new CaptureResult(null, Collections.emptyList(), e, null); }
+        static CaptureResult literal(String l)              { return new CaptureResult(l, Collections.emptyList(), Collections.emptyList(), null, Collections.emptyList()); }
+        static CaptureResult composite(List<CapturedField> f) { return new CaptureResult(null, f, Collections.emptyList(), null, Collections.emptyList()); }
+        static CaptureResult compositeRuntime(List<CapturedField> f, String rt) { return new CaptureResult(null, f, Collections.emptyList(), rt, Collections.emptyList()); }
+        static CaptureResult compositeRuntime(List<CapturedField> f, String rt, List<TracedCall.ConstructorParam> ctor) { return new CaptureResult(null, f, Collections.emptyList(), rt, ctor); }
+        static CaptureResult list(List<CapturedListElement> e) { return new CaptureResult(null, Collections.emptyList(), e, null, Collections.emptyList()); }
     }
 
     /**

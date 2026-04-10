@@ -88,24 +88,43 @@ public final class CapturedParameter {
             List<CapturedField> nestedFields,
             @Nullable String nestedRuntimeType,
             @Nullable String referenceTo,
-            List<String> listElementReferences) {
+            List<String> listElementReferences,
+            boolean hasSetter,
+            List<TracedCall.ConstructorParam> nestedConstructorParams) {
 
-        /** Backwards-compatible 3-arg constructor for literal fields. */
+        /** Backwards-compatible 3-arg constructor for literal fields (assumes setter exists). */
         public CapturedField(String fieldName, String fieldType, @Nullable String value) {
-            this(fieldName, fieldType, value, Collections.emptyList(), null, null, Collections.emptyList());
+            this(fieldName, fieldType, value, Collections.emptyList(), null, null,
+                    Collections.emptyList(), true, Collections.emptyList());
+        }
+
+        /** Literal field with explicit setter flag. */
+        public CapturedField(String fieldName, String fieldType, @Nullable String value, boolean hasSetter) {
+            this(fieldName, fieldType, value, Collections.emptyList(), null, null,
+                    Collections.emptyList(), hasSetter, Collections.emptyList());
         }
 
         public static CapturedField ofNested(String fieldName, String fieldType,
+                                              String runtimeType, List<CapturedField> fields,
+                                              List<TracedCall.ConstructorParam> constructorParams) {
+            return new CapturedField(fieldName, fieldType, null, fields, runtimeType, null,
+                    Collections.emptyList(), true, constructorParams);
+        }
+
+        /** Backwards-compatible ofNested without constructor params. */
+        public static CapturedField ofNested(String fieldName, String fieldType,
                                               String runtimeType, List<CapturedField> fields) {
-            return new CapturedField(fieldName, fieldType, null, fields, runtimeType, null, Collections.emptyList());
+            return ofNested(fieldName, fieldType, runtimeType, fields, Collections.emptyList());
         }
 
         public static CapturedField ofReference(String fieldName, String fieldType, String varName) {
-            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, varName, Collections.emptyList());
+            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, varName,
+                    Collections.emptyList(), true, Collections.emptyList());
         }
 
         public static CapturedField ofListReferences(String fieldName, String fieldType, List<String> refs) {
-            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, null, refs);
+            return new CapturedField(fieldName, fieldType, null, Collections.emptyList(), null, null,
+                    refs, true, Collections.emptyList());
         }
 
         public boolean isNested() { return !nestedFields.isEmpty(); }

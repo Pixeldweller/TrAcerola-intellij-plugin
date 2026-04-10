@@ -449,6 +449,7 @@ public final class MethodTracer {
 
         // POJO — collect instance fields (same shape as ParameterEvaluator.evaluateObjectFields)
         tc.setReturnFieldSignatures(collectInstanceFieldSignatures(psiClass));
+        tc.setReturnConstructorParams(collectBestConstructor(psiClass));
     }
 
     /**
@@ -494,13 +495,61 @@ public final class MethodTracer {
      */
     @NotNull
     static List<ReturnFieldSignature> collectInstanceFieldSignatures(@NotNull PsiClass psiClass) {
+        // Collect public setter names for fast lookup
+        Set<String> publicSetters = new HashSet<>();
+        for (PsiMethod m : psiClass.getAllMethods()) {
+            if (m.hasModifierProperty(PsiModifier.PUBLIC)
+                    && m.getName().startsWith("set")
+                    && m.getParameterList().getParametersCount() == 1) {
+                publicSetters.add(m.getName());
+            }
+        }
+
         List<ReturnFieldSignature> sigs = new ArrayList<>();
         for (PsiField f : psiClass.getAllFields()) {
             if (f.hasModifierProperty(PsiModifier.STATIC)) continue;
             if (f.getName().startsWith("this$")) continue;
-            sigs.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText()));
+            String setterName = "set" + Character.toUpperCase(f.getName().charAt(0))
+                    + f.getName().substring(1);
+            boolean hasSetter = publicSetters.contains(setterName);
+            sigs.add(new ReturnFieldSignature(f.getName(), f.getType().getPresentableText(), hasSetter));
         }
         return sigs;
+    }
+
+    /**
+     * Finds the best constructor for a class. Returns an empty list when a
+     * no-arg constructor is available (either explicit or implicit default).
+     * Otherwise returns the parameters of the constructor with the most
+     * parameters whose names match known field names.
+     */
+    static List<TracedCall.ConstructorParam> collectBestConstructor(@NotNull PsiClass psiClass) {
+        PsiMethod[] constructors = psiClass.getConstructors();
+
+        // No explicit constructors → implicit default constructor exists
+        if (constructors.length == 0) return Collections.emptyList();
+
+        // Check for a no-arg constructor
+        for (PsiMethod ctor : constructors) {
+            if (ctor.getParameterList().getParametersCount() == 0) {
+                return Collections.emptyList();
+            }
+        }
+
+        // No no-arg constructor — pick the one with the most params
+        PsiMethod best = constructors[0];
+        for (int i = 1; i < constructors.length; i++) {
+            if (constructors[i].getParameterList().getParametersCount()
+                    > best.getParameterList().getParametersCount()) {
+                best = constructors[i];
+            }
+        }
+
+        List<TracedCall.ConstructorParam> params = new ArrayList<>();
+        for (PsiParameter p : best.getParameterList().getParameters()) {
+            params.add(new TracedCall.ConstructorParam(p.getName(), p.getType().getPresentableText()));
+        }
+        return params;
     }
 
     /** Internal carrier for the result of {@link #analyzeListShape}. */

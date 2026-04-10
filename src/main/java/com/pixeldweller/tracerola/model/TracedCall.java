@@ -12,8 +12,12 @@ import java.util.List;
  */
 public final class TracedCall {
 
-    /** Signature of a field inside a composite return type (name + declared type). */
-    public record ReturnFieldSignature(String fieldName, String fieldType) {
+    /** Signature of a field inside a composite return type (name + declared type + setter availability). */
+    public record ReturnFieldSignature(String fieldName, String fieldType, boolean hasSetter) {
+        /** Backwards-compatible 2-arg constructor — assumes setter exists. */
+        public ReturnFieldSignature(String fieldName, String fieldType) {
+            this(fieldName, fieldType, true);
+        }
         public String setterName() {
             return "set" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         }
@@ -24,6 +28,9 @@ public final class TracedCall {
             return (isBool ? "is" : "get") + suffix;
         }
     }
+
+    /** A single constructor parameter — name + type. */
+    public record ConstructorParam(String name, String type) {}
 
     private final String qualifierName; // e.g. "inventoryService"
     private final String qualifierType; // e.g. "InventoryService"
@@ -100,6 +107,9 @@ public final class TracedCall {
 
     /** Runtime-captured list elements. Empty unless this call returns a List that was actually captured. */
     private List<CapturedListElement> capturedReturnListElements = Collections.emptyList();
+
+    /** Constructor params for the return type — empty when a no-arg constructor exists. */
+    private List<ConstructorParam> returnConstructorParams = Collections.emptyList();
 
     public TracedCall(String qualifierName,
                       String qualifierType,
@@ -179,6 +189,11 @@ public final class TracedCall {
     /** True when the call has captured list elements ready for emission. */
     public boolean hasCapturedReturnListElements() {
         return !capturedReturnListElements.isEmpty();
+    }
+
+    public List<ConstructorParam> getReturnConstructorParams() { return returnConstructorParams; }
+    public void setReturnConstructorParams(List<ConstructorParam> params) {
+        this.returnConstructorParams = params != null ? List.copyOf(params) : Collections.emptyList();
     }
 
     /**

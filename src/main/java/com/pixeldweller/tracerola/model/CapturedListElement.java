@@ -26,40 +26,33 @@ import java.util.List;
  * <p>If all three slots are empty/null, the element is treated as fully
  * unrecoverable and the generator emits {@code add(null)}.
  */
-public record CapturedListElement(String literal, List<CapturedField> fields, String runtimeType) {
+public record CapturedListElement(String literal, List<CapturedField> fields, String runtimeType,
+                                   List<TracedCall.ConstructorParam> constructorParams) {
 
     public CapturedListElement {
         fields = fields != null ? List.copyOf(fields) : Collections.emptyList();
+        constructorParams = constructorParams != null ? List.copyOf(constructorParams) : Collections.emptyList();
     }
 
     public static CapturedListElement ofLiteral(String literal) {
-        return new CapturedListElement(literal, Collections.emptyList(), null);
+        return new CapturedListElement(literal, Collections.emptyList(), null, Collections.emptyList());
     }
 
     public static CapturedListElement ofFields(List<CapturedField> fields) {
-        return new CapturedListElement(null, fields, null);
+        return new CapturedListElement(null, fields, null, Collections.emptyList());
     }
 
-    /**
-     * Composite element captured against a runtime class that wasn't the same
-     * as the declared element type — e.g. a {@code Notification} inside a
-     * {@code List<Object>}, or a {@code Cat} inside a {@code List<Animal>}.
-     * The generator uses {@link #runtimeType()} as the type for the
-     * {@code new ...()} expression instead of the declared element type, so
-     * subclass-specific fields aren't lost.
-     */
     public static CapturedListElement ofRuntimeFields(String runtimeType, List<CapturedField> fields) {
-        return new CapturedListElement(null, fields, runtimeType);
+        return new CapturedListElement(null, fields, runtimeType, Collections.emptyList());
     }
 
-    /**
-     * Element whose declared-type capture failed but whose runtime simple class
-     * name was successfully read via {@code element.getClass().getSimpleName()}.
-     * The generator emits this as a {@code TODO} marker so the user sees what
-     * was lost rather than having the element silently dropped.
-     */
+    public static CapturedListElement ofRuntimeFields(String runtimeType, List<CapturedField> fields,
+                                                       List<TracedCall.ConstructorParam> constructorParams) {
+        return new CapturedListElement(null, fields, runtimeType, constructorParams);
+    }
+
     public static CapturedListElement ofUnknown(String runtimeType) {
-        return new CapturedListElement(null, Collections.emptyList(), runtimeType);
+        return new CapturedListElement(null, Collections.emptyList(), runtimeType, Collections.emptyList());
     }
 
     public boolean isLiteral() {

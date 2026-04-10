@@ -133,7 +133,8 @@ public final class TestCaseGenerator {
                             ? c.getCapturedReturnRuntimeType() : c.getReturnType();
                     String varName = callVarNames.get(c);
                     appendCompositeConstruction(sb, "    ", varName, emitType,
-                            c.getCapturedReturnFields(), usedReturnVars, varMapping);
+                            c.getCapturedReturnFields(), usedReturnVars, varMapping,
+                            c.getReturnConstructorParams());
                     returnValue = varName;
                 } else if (c.getCapturedReturnValue() != null) {
                     returnValue = c.getCapturedReturnValue();
@@ -344,14 +345,27 @@ public final class TestCaseGenerator {
      * findByIdResult.setAuthor(findByIdResultAuthor);
      * </pre>
      */
-    /** Overload without varMapping — used by parameter emission. */
+    /** Overload without varMapping or constructor params — used by parameter emission. */
     private static void appendCompositeConstruction(@NotNull StringBuilder sb,
                                                      @NotNull String indent,
                                                      @NotNull String varName,
                                                      @NotNull String typeName,
                                                      @NotNull List<CapturedField> fields,
                                                      @NotNull Set<String> usedNames) {
-        appendCompositeConstruction(sb, indent, varName, typeName, fields, usedNames, Collections.emptyMap());
+        appendCompositeConstruction(sb, indent, varName, typeName, fields, usedNames,
+                Collections.emptyMap(), Collections.emptyList());
+    }
+
+    /** Overload without constructor params — backwards compat. */
+    private static void appendCompositeConstruction(@NotNull StringBuilder sb,
+                                                     @NotNull String indent,
+                                                     @NotNull String varName,
+                                                     @NotNull String typeName,
+                                                     @NotNull List<CapturedField> fields,
+                                                     @NotNull Set<String> usedNames,
+                                                     @NotNull Map<String, String> varMapping) {
+        appendCompositeConstruction(sb, indent, varName, typeName, fields, usedNames,
+                varMapping, Collections.emptyList());
     }
 
     private static void appendCompositeConstruction(@NotNull StringBuilder sb,
@@ -360,15 +374,45 @@ public final class TestCaseGenerator {
                                                      @NotNull String typeName,
                                                      @NotNull List<CapturedField> fields,
                                                      @NotNull Set<String> usedNames,
-                                                     @NotNull Map<String, String> varMapping) {
-        sb.append(indent).append(typeName).append(' ').append(varName)
-          .append(" = new ").append(typeName).append("(); // traced\n");
+                                                     @NotNull Map<String, String> varMapping,
+                                                     @NotNull List<TracedCall.ConstructorParam> ctorParams) {
+        // Build a field-name → CapturedField lookup for constructor arg matching
+        Map<String, CapturedField> fieldByName = new LinkedHashMap<>();
+        for (CapturedField f : fields) {
+            fieldByName.put(f.fieldName(), f);
+        }
+
+        // Determine constructor arguments
+        Set<String> usedInConstructor = new LinkedHashSet<>();
+        if (!ctorParams.isEmpty()) {
+            // Match constructor params to captured field values by name
+            List<String> ctorArgs = new ArrayList<>();
+            for (TracedCall.ConstructorParam p : ctorParams) {
+                CapturedField match = fieldByName.get(p.name());
+                if (match != null && match.value() != null) {
+                    ctorArgs.add(match.value());
+                    usedInConstructor.add(p.name());
+                } else {
+                    ctorArgs.add("null /* " + p.name() + " */");
+                }
+            }
+            sb.append(indent).append(typeName).append(' ').append(varName)
+              .append(" = new ").append(typeName).append("(")
+              .append(String.join(", ", ctorArgs))
+              .append("); // traced\n");
+        } else {
+            sb.append(indent).append(typeName).append(' ').append(varName)
+              .append(" = new ").append(typeName).append("(); // traced\n");
+        }
 
         // First pass: emit nested objects (declared before being used in setters)
         // Also collect deferred setter calls for nested/reference fields
         List<String> deferredSetters = new ArrayList<>();
 
         for (CapturedField f : fields) {
+            // Skip fields already passed via constructor
+            if (usedInConstructor.contains(f.fieldName())) continue;
+
             if (f.isNested()) {
                 String nestedVar = varName + capitalize(f.fieldName());
                 int dedup = 2;
@@ -376,20 +420,33 @@ public final class TestCaseGenerator {
                     nestedVar = varName + capitalize(f.fieldName()) + (dedup++);
                 }
                 appendCompositeConstruction(sb, indent, nestedVar,
-                        f.nestedRuntimeType(), f.nestedFields(), usedNames, varMapping);
-                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + nestedVar + ");\n");
+                        f.nestedRuntimeType(), f.nestedFields(), usedNames, varMapping,
+                        f.nestedConstructorParams());
+                if (f.hasSetter()) {
+                    deferredSetters.add(indent + varName + "." + f.setterName() + "(" + nestedVar + ");\n");
+                } else {
+                    deferredSetters.add(indent + "// " + varName + "." + f.setterName() + "(" + nestedVar + "); // no public setter\n");
+                }
             } else if (f.isReference()) {
-                // Rewrite source-code var name → generated var name
                 String ref = varMapping.getOrDefault(f.referenceTo(), f.referenceTo());
-                deferredSetters.add(indent + varName + "." + f.setterName() + "(" + ref + ");\n");
+                if (f.hasSetter()) {
+                    deferredSetters.add(indent + varName + "." + f.setterName() + "(" + ref + ");\n");
+                } else {
+                    deferredSetters.add(indent + "// " + varName + "." + f.setterName() + "(" + ref + "); // no public setter\n");
+                }
             } else if (f.hasListReferences()) {
                 for (String rawRef : f.listElementReferences()) {
                     String ref = varMapping.getOrDefault(rawRef, rawRef);
                     deferredSetters.add(indent + varName + "." + f.listGetterName() + "().add(" + ref + ");\n");
                 }
             } else if (f.value() != null) {
-                sb.append(indent).append(varName).append('.')
-                  .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                if (f.hasSetter()) {
+                    sb.append(indent).append(varName).append('.')
+                      .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                } else {
+                    sb.append(indent).append("// ").append(varName).append('.')
+                      .append(f.setterName()).append('(').append(f.value()).append("); // no public setter\n");
+                }
             }
         }
 
@@ -433,12 +490,41 @@ public final class TestCaseGenerator {
                 // way `new Cat()` shows up inside a `List<Animal>` etc.
                 String thisElemType = elem.runtimeType() != null ? elem.runtimeType() : elemTypeForNew;
                 String elemVar = makeUniqueElementVarName(varName, i, usedNames);
-                sb.append(indent).append(thisElemType).append(' ').append(elemVar)
-                  .append(" = new ").append(thisElemType).append("();\n");
+
+                // Build field-name lookup for constructor matching
+                Map<String, CapturedField> elemFieldByName = new LinkedHashMap<>();
+                for (CapturedField f : elem.fields()) elemFieldByName.put(f.fieldName(), f);
+
+                Set<String> elemCtorUsed = new LinkedHashSet<>();
+                List<TracedCall.ConstructorParam> elemCtorParams = elem.constructorParams();
+                if (!elemCtorParams.isEmpty()) {
+                    List<String> ctorArgs = new ArrayList<>();
+                    for (TracedCall.ConstructorParam p : elemCtorParams) {
+                        CapturedField match = elemFieldByName.get(p.name());
+                        if (match != null && match.value() != null) {
+                            ctorArgs.add(match.value());
+                            elemCtorUsed.add(p.name());
+                        } else {
+                            ctorArgs.add("null /* " + p.name() + " */");
+                        }
+                    }
+                    sb.append(indent).append(thisElemType).append(' ').append(elemVar)
+                      .append(" = new ").append(thisElemType).append("(")
+                      .append(String.join(", ", ctorArgs)).append(");\n");
+                } else {
+                    sb.append(indent).append(thisElemType).append(' ').append(elemVar)
+                      .append(" = new ").append(thisElemType).append("();\n");
+                }
                 for (CapturedField f : elem.fields()) {
+                    if (elemCtorUsed.contains(f.fieldName())) continue;
                     if (f.value() != null) {
-                        sb.append(indent).append(elemVar).append('.')
-                          .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                        if (f.hasSetter()) {
+                            sb.append(indent).append(elemVar).append('.')
+                              .append(f.setterName()).append('(').append(f.value()).append(");\n");
+                        } else {
+                            sb.append(indent).append("// ").append(elemVar).append('.')
+                              .append(f.setterName()).append('(').append(f.value()).append("); // no public setter\n");
+                        }
                     }
                 }
                 sb.append(indent).append(varName).append(".add(").append(elemVar).append(");\n");

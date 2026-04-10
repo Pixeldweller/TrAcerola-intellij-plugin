@@ -331,6 +331,48 @@ public final class ParameterEvaluator {
         }
     }
 
+    /**
+     * Reads the raw presentation string from an already-evaluated {@link XValue},
+     * bypassing {@link #formatForCode}. Waits for the debugger to finish its async
+     * toString computation — if the first {@code setPresentation} call delivers a
+     * "Collecting data…" placeholder, the future stays open so that the follow-up
+     * call (with the real value) can complete it.
+     */
+    @Nullable
+    public static String readRawPresentation(@NotNull XValue xValue) {
+        CompletableFuture<String> future = new CompletableFuture<>();
+        xValue.computePresentation(new XValueNode() {
+            private void offer(@NotNull String value) {
+                if (value.contains("Collecting data")) return; // placeholder — wait for the real value
+                future.complete(value);
+            }
+
+            @Override
+            public void setPresentation(@Nullable Icon icon,
+                                        @Nullable String type,
+                                        @NotNull String value,
+                                        boolean hasChildren) {
+                offer(value);
+            }
+
+            @Override
+            public void setPresentation(@Nullable Icon icon,
+                                        @NotNull XValuePresentation presentation,
+                                        boolean hasChildren) {
+                offer(extractValue(presentation));
+            }
+
+            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator e) {}
+            @Override public boolean isObsolete() { return future.isDone(); }
+        }, XValuePlace.TREE);
+
+        try {
+            return future.get(EVAL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     @Nullable
     public static String toDisplayString(@NotNull XValue value) {
         CompletableFuture<String> future = new CompletableFuture<>();
