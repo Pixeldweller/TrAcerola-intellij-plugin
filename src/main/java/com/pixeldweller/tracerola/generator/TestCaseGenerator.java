@@ -72,6 +72,7 @@ public final class TestCaseGenerator {
         List<TracedCall> mockable = session.getTracedCalls().stream()
                 .filter(c -> !"void".equals(c.getReturnType()))
                 .toList();
+        List<String> saveVerifyLines = new ArrayList<>();
         if (!mockable.isEmpty()) {
             sb.append("    // Mock setup\n");
             Set<String> usedReturnVars = new HashSet<>();
@@ -82,6 +83,17 @@ public final class TestCaseGenerator {
             Map<TracedCall, String> callVarNames = new LinkedHashMap<>();
             for (TracedCall c : mockable) {
                 if (c.hasCapturedReturnFields() || c.hasCapturedReturnListElements()) {
+                    // Save-like methods return the same object — map the result
+                    // variable to the argument's variable instead of a new one.
+                    if (isSaveLikeMethod(c)) {
+                        if (c.getResultVariable() != null && !c.getArgExpressions().isEmpty()) {
+                            String argVar = varMapping.get(c.getArgExpressions().get(0));
+                            if (argVar != null) {
+                                varMapping.putIfAbsent(c.getResultVariable(), argVar);
+                            }
+                        }
+                        continue;
+                    }
                     String varName = makeUniqueReturnVarName(c, usedReturnVars);
                     callVarNames.put(c, varName);
                     // Map the source-code result variable to the generated name
@@ -117,8 +129,35 @@ public final class TestCaseGenerator {
                 }
             }
 
+            // Build the set of variable names that are in scope in the test
+            Set<String> inScopeVars = new HashSet<>();
+            for (CapturedParameter p : session.getParameters()) {
+                inScopeVars.add(p.getName());
+            }
+            inScopeVars.addAll(varMapping.values());
+
             // Second pass: emit code with rewritten references
             for (TracedCall c : mockable) {
+                // Save-like methods: use thenAnswer pass-through instead of
+                // constructing a full return object (reduces overmocking).
+                if (isSaveLikeMethod(c)) {
+                    sb.append("    when(").append(c.getQualifierName()).append('.')
+                      .append(c.getMethodName()).append("(any()))")
+                      .append(".thenAnswer(inv -> inv.getArgument(0));\n");
+                    // Build a verify line for the assertions section
+                    String verifyArg = "any()";
+                    if (!c.getArgExpressions().isEmpty()) {
+                        String arg = c.getArgExpressions().get(0);
+                        String rewritten = varMapping.getOrDefault(arg, arg);
+                        if (inScopeVars.contains(rewritten) || isLiteralExpression(rewritten)) {
+                            verifyArg = rewritten;
+                        }
+                    }
+                    saveVerifyLines.add("    verify(" + c.getQualifierName() + ")."
+                            + c.getMethodName() + "(" + verifyArg + ");");
+                    continue;
+                }
+
                 String returnValue;
                 String traceComment = null;
 
@@ -149,9 +188,17 @@ public final class TestCaseGenerator {
                         && !c.getReturnType().equals(c.getCapturedReturnRuntimeType())
                         && c.hasCapturedReturnFields();
 
-                // Rewrite mock argument expressions using the variable mapping
+                // Rewrite mock argument expressions using the variable mapping.
+                // If an argument references a variable not in scope (e.g. a local
+                // created via 'new' in the source method), use any() instead.
                 List<String> rewrittenArgs = c.getArgExpressions().stream()
-                        .map(arg -> varMapping.getOrDefault(arg, arg))
+                        .map(arg -> {
+                            String rewritten = varMapping.getOrDefault(arg, arg);
+                            if (inScopeVars.contains(rewritten) || isLiteralExpression(rewritten)) {
+                                return rewritten;
+                            }
+                            return "any()";
+                        })
                         .toList();
                 sb.append("    when(").append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
@@ -218,6 +265,9 @@ public final class TestCaseGenerator {
                       .append(String.join(", ", c.getArgExpressions()))
                       .append(");\n");
                 }
+            }
+            for (String verifyLine : saveVerifyLines) {
+                sb.append(verifyLine).append('\n');
             }
         }
 
@@ -578,6 +628,13 @@ public final class TestCaseGenerator {
         }
     }
 
+    /** Returns {@code true} for repository persist/merge methods that return the same object. */
+    private static boolean isSaveLikeMethod(@NotNull TracedCall c) {
+        String name = c.getMethodName();
+        return "save".equals(name) || "saveAndFlush".equals(name)
+                || "saveAll".equals(name) || "persist".equals(name);
+    }
+
     /** Recursively collects all reference and list-reference identity paths from fields. */
     private static void collectReferences(@Nullable List<CapturedField> fields, @NotNull Set<String> out) {
         if (fields == null) return;
@@ -590,6 +647,19 @@ public final class TestCaseGenerator {
                 collectReferences(f.nestedFields(), out);
             }
         }
+    }
+
+    /**
+     * Returns {@code true} if the expression looks like a Java literal (string,
+     * number, boolean, null, enum constant, or factory call like {@code new BigDecimal("1")}).
+     */
+    private static boolean isLiteralExpression(@NotNull String expr) {
+        if (expr.startsWith("\"") || expr.startsWith("'")) return true;   // string/char
+        if ("null".equals(expr) || "true".equals(expr) || "false".equals(expr)) return true;
+        if (expr.matches("-?\\d.*")) return true;                          // number
+        if (expr.contains(".") && expr.matches("[A-Z].*")) return true;    // Enum.VALUE or Type.parse(...)
+        if (expr.startsWith("new ")) return true;                          // constructor call
+        return false;
     }
 
     static String capitalize(String s) {

@@ -51,7 +51,7 @@ public final class MethodStepper {
     private static final long SETTLE_MS = 1000;
 
     /** Extra wait when an evaluation comes back as IntelliJ's "Collecting data…" placeholder. */
-    private static final long COLLECTING_RETRY_MS = 2500;
+    private static final long COLLECTING_RETRY_MS = 500;
 
     /** Hard cap on list-element captures so a {@code findAll()} of 100k rows doesn't hang the stepper. */
     private static final int MAX_LIST_ELEMENTS = 50;
