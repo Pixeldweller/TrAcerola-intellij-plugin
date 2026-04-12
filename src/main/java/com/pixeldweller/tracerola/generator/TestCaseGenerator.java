@@ -73,13 +73,21 @@ public final class TestCaseGenerator {
                 .filter(c -> !"void".equals(c.getReturnType()))
                 .toList();
         List<String> saveVerifyLines = new ArrayList<>();
+        // Exception / early-return paths may not exercise all mocks — use lenient
+        // stubbing so Mockito's strict mode doesn't fail on unused stubs.
+        boolean useLenient = session.getThrownExceptionType() != null;
+        String whenPrefix = useLenient ? "lenient().when(" : "when(";
+
+        // Variable mapping: source-code names → generated test variable names.
+        // Built during mock setup, also used in assertions for reference fields.
+        Map<String, String> varMapping = new LinkedHashMap<>();
+
         if (!mockable.isEmpty()) {
             sb.append("    // Mock setup\n");
             Set<String> usedReturnVars = new HashSet<>();
 
             // First pass: assign generated variable names and build source → generated mapping.
             // This lets us rewrite references like "book" → "findByIdResult" everywhere.
-            Map<String, String> varMapping = new LinkedHashMap<>();
             Map<TracedCall, String> callVarNames = new LinkedHashMap<>();
             for (TracedCall c : mockable) {
                 if (c.hasCapturedReturnFields() || c.hasCapturedReturnListElements()) {
@@ -141,9 +149,27 @@ public final class TestCaseGenerator {
                 // Save-like methods: use thenAnswer pass-through instead of
                 // constructing a full return object (reduces overmocking).
                 if (isSaveLikeMethod(c)) {
-                    sb.append("    when(").append(c.getQualifierName()).append('.')
-                      .append(c.getMethodName()).append("(any()))")
-                      .append(".thenAnswer(inv -> inv.getArgument(0));\n");
+                    List<CapturedField> mutations = c.getSaveMutations();
+                    if (mutations.isEmpty()) {
+                        // Pure pass-through — no DB-side changes detected
+                        sb.append("    ").append(whenPrefix).append(c.getQualifierName()).append('.')
+                          .append(c.getMethodName()).append("(any()))")
+                          .append(".thenAnswer(inv -> inv.getArgument(0));\n");
+                    } else {
+                        // DB-side mutations detected — emit thenAnswer with simulated changes
+                        String emitType = c.getCapturedReturnRuntimeType() != null
+                                ? c.getCapturedReturnRuntimeType() : c.getReturnType();
+                        sb.append("    ").append(whenPrefix).append(c.getQualifierName()).append('.')
+                          .append(c.getMethodName()).append("(any()))")
+                          .append(".thenAnswer(inv -> {\n");
+                        sb.append("        ").append(emitType).append(" entity = inv.getArgument(0);\n");
+                        for (CapturedField m : mutations) {
+                            sb.append("        entity.").append(m.setterName())
+                              .append('(').append(m.value()).append("); // simulate DB\n");
+                        }
+                        sb.append("        return entity;\n");
+                        sb.append("    });\n");
+                    }
                     // Build a verify line for the assertions section
                     String verifyArg = "any()";
                     if (!c.getArgExpressions().isEmpty()) {
@@ -200,7 +226,7 @@ public final class TestCaseGenerator {
                             return "any()";
                         })
                         .toList();
-                sb.append("    when(").append(c.getQualifierName()).append('.')
+                sb.append("    ").append(whenPrefix).append(c.getQualifierName()).append('.')
                   .append(c.getMethodName()).append('(')
                   .append(String.join(", ", rewrittenArgs))
                   .append(")).thenReturn(").append(returnValue).append(");");
@@ -247,12 +273,8 @@ public final class TestCaseGenerator {
                 if (session.hasCapturedReturnListElements()) {
                     appendListAssertions(sb, "    ", "result", session.getCapturedReturnListElements());
                 } else if (session.hasCapturedReturnFields()) {
-                    for (CapturedField f : session.getCapturedReturnFields()) {
-                        if (f.value() != null) {
-                            sb.append("    assertEquals(").append(f.value())
-                              .append(", result.").append(f.getterName()).append("());\n");
-                        }
-                    }
+                    appendFieldAssertions(sb, "    ", "result",
+                            session.getCapturedReturnFields(), varMapping);
                 } else if (session.getCapturedReturnValue() != null) {
                     sb.append("    assertEquals(").append(session.getCapturedReturnValue())
                       .append(", result);\n");
@@ -614,17 +636,43 @@ public final class TestCaseGenerator {
                 sb.append(indent).append("assertEquals(").append(elem.literal())
                   .append(", ").append(accessor).append(");\n");
             } else if (elem.isComposite()) {
-                for (CapturedField f : elem.fields()) {
-                    if (f.value() != null) {
-                        sb.append(indent).append("assertEquals(").append(f.value())
-                          .append(", ").append(accessor).append('.')
-                          .append(f.getterName()).append("());\n");
-                    }
-                }
+                appendFieldAssertions(sb, indent, accessor, elem.fields(), Collections.emptyMap());
             } else if (elem.isUnknown()) {
                 sb.append(indent).append("// TODO assert ").append(accessor)
                   .append(": runtime type was ").append(elem.runtimeType()).append('\n');
             }
+        }
+    }
+
+    /**
+     * Emits assertions for a list of captured fields, handling literals, references,
+     * and nested POJOs recursively.
+     *
+     * <pre>
+     * assertEquals("The Hobbit", result.getTitle());
+     * assertSame(findByIdResult, result.getBook());           // reference
+     * assertEquals("J.R.R. Tolkien", result.getAuthor().getName()); // nested
+     * </pre>
+     */
+    private static void appendFieldAssertions(@NotNull StringBuilder sb,
+                                               @NotNull String indent,
+                                               @NotNull String accessor,
+                                               @NotNull List<CapturedField> fields,
+                                               @NotNull Map<String, String> varMapping) {
+        for (CapturedField f : fields) {
+            String fieldAccessor = accessor + "." + f.getterName() + "()";
+            if (f.value() != null) {
+                sb.append(indent).append("assertEquals(").append(f.value())
+                  .append(", ").append(fieldAccessor).append(");\n");
+            } else if (f.isReference()) {
+                String ref = varMapping.getOrDefault(f.referenceTo(), f.referenceTo());
+                sb.append(indent).append("assertSame(").append(ref)
+                  .append(", ").append(fieldAccessor).append(");\n");
+            } else if (f.isNested()) {
+                // Recurse into nested POJO fields
+                appendFieldAssertions(sb, indent, fieldAccessor, f.nestedFields(), varMapping);
+            }
+            // hasListReferences — skip for now; list identity assertions are rare
         }
     }
 

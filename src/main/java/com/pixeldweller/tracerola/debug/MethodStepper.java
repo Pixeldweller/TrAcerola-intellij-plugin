@@ -51,7 +51,7 @@ public final class MethodStepper {
     private static final long SETTLE_MS = 1000;
 
     /** Extra wait when an evaluation comes back as IntelliJ's "Collecting data…" placeholder. */
-    private static final long COLLECTING_RETRY_MS = 500;
+    private static final long COLLECTING_RETRY_MS = 1000;
 
     /** Hard cap on list-element captures so a {@code findAll()} of 100k rows doesn't hang the stepper. */
     private static final int MAX_LIST_ELEMENTS = 50;
@@ -87,6 +87,9 @@ public final class MethodStepper {
 
     /** Captured method return — element list for {@code List<E>} returns. */
     private List<CapturedListElement> capturedMethodReturnListElements = Collections.emptyList();
+
+    /** Argument fields captured for a return-position save-like call (pre-captured while evaluator is available). */
+    private List<CapturedField> capturedSaveArgFields = Collections.emptyList();
 
     /**
      * Per-trace cache of runtime FQN → field signatures, used by the list-element
@@ -221,7 +224,6 @@ public final class MethodStepper {
             ApplicationManager.getApplication().invokeLater(() -> {
                 ApplicationManager.getApplication().executeOnPooledThread(() -> {
                     stepCount++;
-                    stateService.setTracingStatus("Stepping… (line " + (currentLine + 1) + ")");
 
                     // Give the XValueTree a moment to settle before evaluating result vars.
                     sleepQuietly(SETTLE_MS);
@@ -230,7 +232,6 @@ public final class MethodStepper {
                     // pauses on the *next* statement to be executed, so a call on line N is
                     // only "done" once we've moved off it. Shifting the window back by one
                     // makes the inclusion test fire after the call has actually executed.
-                    stateService.setTracingStatus("Capturing return values… (line " + (currentLine + 1) + ")");
                     captureReturnValues(previousLine - 1, currentLine - 1);
 
                     // Method-return capture uses the *unshifted* current line, because
@@ -244,7 +245,6 @@ public final class MethodStepper {
 
                     previousLine = currentLine;
 
-                    stateService.setTracingStatus("Stepping… (step " + stepCount + ")");
                     ApplicationManager.getApplication().invokeLater(() -> session.stepOver(false));
                 });
             });
@@ -312,6 +312,7 @@ public final class MethodStepper {
                 // can reference back to it (e.g. author.books[0] → this book).
                 registerObjectIdentity(evaluator, resultVar, resultVar);
                 applyCapture(call, captureExpression(evaluator, resultVar, spec));
+                detectSaveMutations(evaluator, call);
                 continue;
             }
 
@@ -322,6 +323,7 @@ public final class MethodStepper {
                 CaptureResult result = captureExpression(evaluator, backtraceExpr, spec);
                 if (result != null) {
                     applyCapture(call, result);
+                    detectSaveMutations(evaluator, call);
                     break;
                 }
             }
@@ -343,8 +345,6 @@ public final class MethodStepper {
         String returnExpr = returnAnalysis.returnPoints().get(currentLine);
         if (returnExpr == null) return;
 
-        stateService.setTracingStatus("Capturing method return value…");
-
         XStackFrame frame = session.getCurrentStackFrame();
         if (frame == null) return;
         XDebuggerEvaluator evaluator = frame.getEvaluator();
@@ -361,6 +361,32 @@ public final class MethodStepper {
         } else if (!result.listElements.isEmpty()) {
             capturedMethodReturnListElements = result.listElements;
         }
+
+        // For return-position save-like calls, pre-capture the argument POJO fields
+        // while the evaluator is still available. The diff against the return fields
+        // is computed later in feedReturnPositionCalls().
+        for (TracedCall call : calls) {
+            if (!call.isInReturnPosition()) continue;
+            if (!SAVE_LIKE_METHODS.contains(call.getMethodName())) continue;
+            if (call.getArgExpressions().isEmpty()) continue;
+
+            String argExpr = call.getArgExpressions().get(0);
+            List<ReturnFieldSignature> sigs = call.getReturnFieldSignatures();
+            if (sigs.isEmpty()) {
+                // Resolve field signatures from the argument's runtime FQN
+                String argFqn = evaluateRuntimeFqn(evaluator, argExpr);
+                if (argFqn != null) {
+                    sigs = resolveRuntimeFieldSignatures(deproxyFqn(argFqn));
+                }
+            }
+            if (!sigs.isEmpty()) {
+                CaptureResult argResult = capturePojoFields(evaluator, argExpr, sigs);
+                if (argResult != null && !argResult.fields.isEmpty()) {
+                    capturedSaveArgFields = argResult.fields;
+                }
+            }
+            break; // typically one return-position call
+        }
     }
 
     /**
@@ -372,7 +398,7 @@ public final class MethodStepper {
         String exType = returnAnalysis.throwPoints().get(currentLine);
         if (exType != null) {
             thrownExceptionType = exType;
-            stateService.setTracingStatus("Exception detected: " + exType);
+            stateService.setTracingStatus("Exception path: " + exType);
         }
     }
 
@@ -484,7 +510,6 @@ public final class MethodStepper {
         List<CapturedListElement> elements = new ArrayList<>(captureCount);
 
         for (int i = 0; i < captureCount; i++) {
-            stateService.setTracingStatus("Capturing list element " + (i + 1) + "/" + captureCount + "…");
             CapturedListElement captured = captureSingleListElement(
                     evaluator, expression + ".get(" + i + ")", elementSpec);
             if (captured != null) elements.add(captured);
@@ -529,7 +554,6 @@ public final class MethodStepper {
 
         // 3 + 4. Try the runtime class's field signatures (cached per FQN).
         if (runtimeFqn != null) {
-            stateService.setTracingStatus("Resolving " + simpleNameOf(runtimeFqn) + "…");
             List<ReturnFieldSignature> runtimeSigs = resolveRuntimeFieldSignatures(runtimeFqn);
             if (!runtimeSigs.isEmpty()) {
                 boolean proxy = rawElemFqn != null && isProxyFqn(rawElemFqn);
@@ -981,6 +1005,28 @@ public final class MethodStepper {
             } else if (!capturedMethodReturnListElements.isEmpty()) {
                 call.setCapturedReturnListElements(capturedMethodReturnListElements);
             }
+
+            // For save-like calls, diff pre-captured argument fields against return
+            // fields to detect DB-side mutations (e.g. id assignment).
+            if (SAVE_LIKE_METHODS.contains(call.getMethodName())
+                    && !capturedSaveArgFields.isEmpty()
+                    && call.hasCapturedReturnFields()) {
+                Map<String, String> argValues = new HashMap<>();
+                for (CapturedField f : capturedSaveArgFields) {
+                    argValues.put(f.fieldName(), f.value());
+                }
+                List<CapturedField> mutations = new ArrayList<>();
+                for (CapturedField retField : call.getCapturedReturnFields()) {
+                    if (retField.value() == null) continue;
+                    String argVal = argValues.get(retField.fieldName());
+                    if (!Objects.equals(argVal, retField.value())) {
+                        mutations.add(retField);
+                    }
+                }
+                if (!mutations.isEmpty()) {
+                    call.setSaveMutations(mutations);
+                }
+            }
         }
     }
 
@@ -999,6 +1045,57 @@ public final class MethodStepper {
             }
         } else if (!result.listElements.isEmpty()) {
             call.setCapturedReturnListElements(result.listElements);
+        }
+    }
+
+    private static final Set<String> SAVE_LIKE_METHODS = Set.of(
+            "save", "saveAndFlush", "saveAll", "persist");
+
+    /**
+     * For save-like calls, captures the first argument's POJO fields and compares
+     * them against the already-captured return fields.  Any field whose value
+     * differs (e.g. {@code id: null → 1L}) is stored as a "save mutation" on the
+     * call so the generator can emit a {@code thenAnswer} block that simulates
+     * the DB-side change.
+     */
+    private void detectSaveMutations(@NotNull XDebuggerEvaluator evaluator,
+                                      @NotNull TracedCall call) {
+        if (!SAVE_LIKE_METHODS.contains(call.getMethodName())) return;
+        if (call.getArgExpressions().isEmpty()) return;
+        if (!call.hasCapturedReturnFields()) return;
+
+        String argExpr = call.getArgExpressions().get(0);
+        // Use the same field signatures as the return type to capture the argument
+        List<ReturnFieldSignature> sigs = call.getReturnFieldSignatures();
+        if (sigs.isEmpty()) {
+            // Resolve field signatures from the argument's runtime FQN
+            String argFqn = evaluateRuntimeFqn(evaluator, argExpr);
+            if (argFqn != null) {
+                sigs = resolveRuntimeFieldSignatures(deproxyFqn(argFqn));
+            }
+        }
+        if (sigs.isEmpty()) return;
+
+        CaptureResult argResult = capturePojoFields(evaluator, argExpr, sigs);
+        if (argResult == null || argResult.fields.isEmpty()) return;
+
+        // Build field→value map from the argument
+        Map<String, String> argValues = new HashMap<>();
+        for (CapturedField f : argResult.fields) {
+            argValues.put(f.fieldName(), f.value());
+        }
+
+        // Compare against return fields — collect mutations
+        List<CapturedField> mutations = new ArrayList<>();
+        for (CapturedField retField : call.getCapturedReturnFields()) {
+            if (retField.value() == null) continue; // can't compare nested objects
+            String argVal = argValues.get(retField.fieldName());
+            if (!Objects.equals(argVal, retField.value())) {
+                mutations.add(retField);
+            }
+        }
+        if (!mutations.isEmpty()) {
+            call.setSaveMutations(mutations);
         }
     }
 

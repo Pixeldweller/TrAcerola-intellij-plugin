@@ -111,6 +111,13 @@ public final class TracedCall {
     /** Constructor params for the return type — empty when a no-arg constructor exists. */
     private List<ConstructorParam> returnConstructorParams = Collections.emptyList();
 
+    /**
+     * For save-like methods: fields that changed between the argument and return
+     * value (e.g. {@code id: null → 1L}). Used by the generator to emit
+     * {@code thenAnswer} blocks that simulate DB behaviour.
+     */
+    private List<CapturedField> saveMutations = Collections.emptyList();
+
     public TracedCall(String qualifierName,
                       String qualifierType,
                       String methodName,
@@ -194,6 +201,11 @@ public final class TracedCall {
     public List<ConstructorParam> getReturnConstructorParams() { return returnConstructorParams; }
     public void setReturnConstructorParams(List<ConstructorParam> params) {
         this.returnConstructorParams = params != null ? List.copyOf(params) : Collections.emptyList();
+    }
+
+    public List<CapturedField> getSaveMutations() { return saveMutations; }
+    public void setSaveMutations(List<CapturedField> mutations) {
+        this.saveMutations = mutations != null ? List.copyOf(mutations) : Collections.emptyList();
     }
 
     /**
